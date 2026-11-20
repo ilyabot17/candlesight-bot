@@ -1,0 +1,12 @@
+{
+  "name": "candlesight-telegram-daemon",
+  "version": "1.0.0",
+  "description": "24/7 Cloud Assistant Daemon for CandleSight AI",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.21.0"
+  }
+}
