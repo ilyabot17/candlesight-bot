@@ -1,42 +1,79 @@
 /**
- * CandleSight Autonomous 24/7 Telegram Assistant Daemon
- * Complete question-answering intelligence with live site scraping,
- * live market prices, launch timelines, technical rules, and button handling.
+ * CandleSight Autonomous Top-5 Market Scanner v3
+ * 24/7 Background Scanner for:
+ * 1. Gold Futures (GC=F, fallback PAXG-USD)
+ * 2. Bitcoin (BTC-USD)
+ * 3. Ethereum (ETH-USD)
+ * 4. Solana (SOL-USD)
+ * 5. Nasdaq Futures (NQ=F, fallback QQQ)
+ *
+ * Mirrors CandleSight Pine Script v6 (EMA 9/21/50 + MACD 12/26/9 + ATR 14) on confirmed 5m closes.
+ * Sends ultra-short execution pings (Direction, Size, Entry, SL, TP1, TP2) to Telegram.
  */
 
 const https = require('https');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || 'AQ.Ab8RN6I4lp20NKYun7LhqWTZ_U6fkdk1WUnhLW38RCsPnHXByg';
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-const aiModel = genAI.getGenerativeModel({ model: 'gemini-flash-latest' });
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '9271364424:AAHSarBS1g7wVpjERsHTaHyUnoCJlrDTJ3E';
+const ADMIN_CHAT_ID = process.env.TELEGRAM_ADMIN_CHAT_ID || '6938216386';
+const TARGET_RISK_USD = 50; // Micro-risk ($50 risk per trade to protect $311 drawdown buffer)
 
-const SYSTEM_CONTEXT = `
-You are the personal AI Trading & Operations Executive Assistant for Ilya, founder of CandleSight AI (candlesightai.com).
-You have full awareness of the entire CandleSight ecosystem:
-- The website is live at https://candlesightai.com.
-- Stripe is 100% active with 4 tiers: Prop Risk Sizer ($5/mo), Trend Radar Pro ($19/mo), POC Heatmap ($39/mo), VIP All-Access + Trade Copier ($79/mo).
-- Webhook endpoint is live at /api/stripe/webhook and generates member keys automatically.
-- TradingView Pine Script v5 is fully built with Dual-Direction BUY/LONG and SELL/SHORT signals, anti-wick Stop Shield, and timely Take Profit exits.
-- VIP Multi-Account Trade Copier is live at /api/copier with sub-5ms execution and auto-proportional lot sizing across $100k, $25k, and $10k accounts.
-- Partner broker: Vest Markets (code: NHCANDLESIGHTAI, link: https://next.vestmarkets.com/r/nhcandlesightai).
-- Roadmap: 5 days of private testing this week (Mon-Fri), Twitch & Kick livestream setup this weekend, 14-day $70 to $2,000 payout public challenge starting Nov 23, clipper team funded by the $2k payout, and a high-ticket $765/year fully autonomous bot dropping in Month 2 (2027) targeting 4x $100k accounts ($4k/mo passive).
-- Personal trading record: Highest single-session win was +$1,732.50 USD on Bitcoin long expansion; total paper equity preserved at $102,700+.
+const SYMBOLS = [
+  { id: 'GOLD', name: 'Gold (GC)', ticker: 'GC=F', fallbackPair: 'PAXG-USD', source: 'yahoo', unit: 'GC', decimals: 0, icon: '👑' },
+  { id: 'BTC', name: 'Bitcoin (BTC)', pair: 'BTC-USD', source: 'coinbase', unit: 'BTC', decimals: 2, icon: '🟠' },
+  { id: 'ETH', name: 'Ethereum (ETH)', pair: 'ETH-USD', source: 'coinbase', unit: 'ETH', decimals: 1, icon: '🔷' },
+  { id: 'SOL', name: 'Solana (SOL)', pair: 'SOL-USD', source: 'coinbase', unit: 'SOL', decimals: 0, icon: '🟣' },
+  { id: 'NQ', name: 'Nasdaq (NQ)', ticker: 'NQ=F', fallbackTicker: 'QQQ', source: 'yahoo', unit: 'NQ', decimals: 2, icon: '📈' },
+];
 
-Tone: Confident, crisp, razor-sharp, loyal, encouraging, and institutional.
-Always answer Ilya's questions directly and accurately. Keep formatting clean with bullet points and bold text where appropriate.
-`;
+const lastAlerted = {};
+const marketRegistry = {};
+let startupSent = false;
 
-const TOKEN = '9271364424:AAHSarBS1g7wVpjERsHTaHyUnoCJlrDTJ3E';
-const ALLOWED_CHAT_ID = '6938216386';
+function isWeekendShieldActive() {
+  const now = new Date();
+  const estString = now.toLocaleString("en-US", { timeZone: "America/New_York" });
+  const estDate = new Date(estString);
+  const day = estDate.getDay(); // 0 = Sun, 5 = Fri, 6 = Sat
+  const hour = estDate.getHours();
 
-let offset = 0;
+  // Friday 5 PM EST through Sunday 6 PM EST
+  if (day === 5 && hour >= 17) return true;
+  if (day === 6) return true;
+  if (day === 0 && hour < 18) return true;
+  return false;
+}
 
-function sendTelegram(endpoint, payload) {
+function fetchJson(url, headers = {}) {
   return new Promise((resolve) => {
-    const data = JSON.stringify(payload);
+    https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0', ...headers }, timeout: 10000 }, (res) => {
+      let body = '';
+      res.on('data', (d) => (body += d));
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(body));
+        } catch (e) {
+          console.error(`[PARSE ERR] ${url}: ${e.message}`);
+          resolve(null);
+        }
+      });
+    }).on('error', (err) => {
+      console.error(`[NET ERR] ${url}: ${err.message}`);
+      resolve(null);
+    });
+  });
+}
+
+function sendTelegramMessage(text) {
+  return new Promise((resolve) => {
+    const data = JSON.stringify({
+      chat_id: ADMIN_CHAT_ID,
+      text,
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+    });
+
     const req = https.request(
-      `https://api.telegram.org/bot${TOKEN}/${endpoint}`,
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
       {
         method: 'POST',
         headers: {
@@ -46,262 +83,426 @@ function sendTelegram(endpoint, payload) {
         timeout: 10000,
       },
       (res) => {
-        let body = '';
-        res.on('data', (d) => (body += d));
+        let b = '';
+        res.on('data', (c) => (b += c));
         res.on('end', () => {
-          try {
-            resolve(JSON.parse(body));
-          } catch (e) {
-            resolve({ ok: false, description: body });
+          if (res.statusCode !== 200) {
+            console.error(`[TG HTTP ${res.statusCode}] ${b}`);
+            resolve(false);
+          } else {
+            resolve(true);
           }
         });
       }
     );
-    req.on('timeout', () => {
-      req.destroy();
-      resolve({ ok: false, description: 'Request timeout' });
+    req.on('error', (err) => {
+      console.error(`[TG ERR] ${err.message}`);
+      resolve(false);
     });
-    req.on('error', (e) => resolve({ ok: false, description: e.message }));
     req.write(data);
     req.end();
   });
 }
 
-function fetchHttps(url) {
-  return new Promise((resolve) => {
-    https.get(url, (res) => {
-      let data = '';
-      res.on('data', (c) => (data += c));
-      res.on('end', () => {
-        try {
-          resolve(JSON.parse(data));
-        } catch (e) {
-          resolve(null);
-        }
-      });
-    }).on('error', () => resolve(null));
-  });
+function calculateEMA(prices, period) {
+  const k = 2 / (period + 1);
+  const ema = [prices[0]];
+  for (let i = 1; i < prices.length; i++) {
+    ema.push(prices[i] * k + ema[i - 1] * (1 - k));
+  }
+  return ema;
 }
 
-async function answerQuestionIntelligently(rawText) {
-  const q = rawText.trim().toLowerCase();
-
-  // 1. Stripe / Payment Account Creation
-  if (q.includes('strip') || q.includes('create the strip') || q.includes('payment') || q.includes('merchant') || q.includes('card')) {
-    return (
-      '💳 *About Setting Up Stripe:*\n\n' +
-      'Because Stripe is a federal-regulated financial processor that requires your legal SSN/EIN, physical address, and bank account for daily payouts, **an AI bot cannot legally register the account for you without your personal identity documents.**\n\n' +
-      '👉 *What you need to do (takes 3 min):*\n' +
-      '1. Open https://dashboard.stripe.com/register\n' +
-      '2. Business Name: *CandleSight AI*\n' +
-      '3. Create 2 recurring links:\n' +
-      '   • $19/month (Trend Radar Pro)\n' +
-      '   • $5/month (Prop Risk Sizer)\n\n' +
-      'Text me the 2 links here, and I will instantly connect them to the checkout buttons on https://candlesightai.com!'
-    );
-  }
-
-  // 2. Launch Date / Timeline / How Likely
-  if (q.includes('launch') || q.includes('when') || q.includes('end of the month') || q.includes('ready') || q.includes('likely') || q.includes('schedule')) {
-    return (
-      '🎯 *Launch Readiness: 95% Ready (100% on track for end of month)*\n\n' +
-      '• *Frontend UI:* 100% (Apple ceramic light mode, floating mesh hues)\n' +
-      '• *Live Heatmap:* 100% (BTC, ETH, SOL, NVDA, SPY, TSLA, GOLD with VAH/VAL 70%)\n' +
-      '• *Trend Radar:* 100% (15M / 1H / 4H timeframes + search filters)\n' +
-      '• *Legal Suite:* 100% (/terms, /disclaimer with CFTC 4.41, /privacy)\n' +
-      '• *Affiliate:* 100% (Vest Markets `NHCANDLESIGHTAI` pre-bound)\n\n' +
-      '**The ONLY pending step:** Creating your 2 Stripe payment links so we can take credit cards. We have over 2 full weeks before month-end, so we are well ahead of schedule!'
-    );
-  }
-
-  // 3. $765 Autonomous Bot
-  if (q.includes('765') || q.includes('bot') || q.includes('autonomous')) {
-    return (
-      '🤖 *The $765/Year Fully Autonomous Bot Engine:*\n\n' +
-      '• **The Concept:** 100% headless algorithmic execution (runs in the cloud with zero screen time or human intervention).\n' +
-      '• **The Math:** Configured for 4 x $100k funded prop accounts ($400k capital) targeting a conservative 1% monthly gain = **$4,000/month completely passive**.\n' +
-      '• **Pricing:** $765/year (Annual recurring license).\n' +
-      '• **Launch Roadmap:** We will drop this in Month 2 (early 2027) with a limited 25-seat founding member cohort ($19,125 cash collected on day 1) after your 2-week streaming challenge proves proof of payout!'
-    );
-  }
-
-  // 4. Website Prices / Products
-  if (q.includes('price') || q.includes('prices') || q.includes('cost') || q.includes('charge') || q.includes('how much') || q.includes('tier')) {
-    return (
-      '💰 *Official CandleSight AI Pricing Live on Website:*\n\n' +
-      '1. **Trend Radar Starter / Pro:** `$19 / month`\n' +
-      '   • Multi-asset algorithmic bias (BTC, ETH, SOL, SPY, NVDA, TSLA, Gold)\n' +
-      '   • 15M, 1H, 4H timeframe switching\n' +
-      '   • TradingView invite-only Pine Script overlay\n\n' +
-      '2. **Prop Risk & Position Sizer:** `$5 / month`\n' +
-      '   • Standalone lot sizing tool preventing evaluation rule breaches\n\n' +
-      '3. **Funded Evaluation Challenge:** `$70`\n' +
-      '   • Official $5,000 1-Step Vest Markets challenge using partner code `NHCANDLESIGHTAI`'
-    );
-  }
-
-  // 4. Live Website & API Status Checks
-  if (q.includes('status') || q.includes('bug') || q.includes('running') || q.includes('working') || q.includes('health') || q.includes('check')) {
-    const pocBTC = await fetchHttps('https://candlesightai.com/api/poc?symbol=BTC');
-    const livePrice = pocBTC?.midPrice ? `$${pocBTC.midPrice.toLocaleString()}` : 'Live';
-
-    return (
-      '🟢 *CandleSight System Status: 100% Healthy*\n\n' +
-      `• *Website:* https://candlesightai.com (200 OK)\n` +
-      `• *Live BTC Price:* ${livePrice} (Coinbase API connected)\n` +
-      `• *Timeframes:* 15M, 1H, 4H active\n` +
-      `• *Heatmap Assets:* 7 live instruments (BTC, ETH, SOL, NVDA, SPY, TSLA, GOLD)\n` +
-      `• *Legal Routes:* /terms, /disclaimer, /privacy 100% public\n\n` +
-      'No errors or broken links detected.'
-    );
-  }
-
-  // 5. Personal Trading History, Biggest Win, and Realized PnL
-  if (q.includes('earn') || q.includes('biggest') || q.includes('pnl') || q.includes('profit') || q.includes('trade history') || q.includes('win') || q.includes('record')) {
-    return (
-      '🏆 *Your Biggest Trading & Earning Record:*\n\n' +
-      'Your highest single-session realized gain during our live trading sessions was **+$1,732.50 USD** on Bitcoin (`BTCUSDT`) during the high-volatility 1-hour trend expansion!\n\n' +
-      '• **Largest Single Winner:** `+$1,732.50` (BTC Long expansion)\n' +
-      '• **Second Largest Runner:** `+$984.00` (ETH momentum continuation)\n' +
-      '• **Recent Controlled Session:** Realized `+$405.00` on ETH, took a disciplined `-$269.73` stop on SOL, locking **+$135.27 GREEN** for the day with zero tilt!\n' +
-      '• **Total Paper Equity:** Safely preserved at **$102,700+ USD**.'
-    );
-  }
-
-  // 6. Technical Strategy & Rules
-  if (q.includes('rule') || q.includes('strategy') || q.includes('ema') || q.includes('vwap') || q.includes('how to trade')) {
-    return (
-      '📈 *CandleSight Core Institutional Trading Rules:*\n\n' +
-      '1. **Directional Filter:** Never trade against the 1-Hour Trend Radar.\n' +
-      '2. **Execution Timing:** Enter only on micro 1-minute 9 EMA pullbacks.\n' +
-      '3. **Target:** Session VWAP or POC Value Area High/Low.\n' +
-      '4. **Risk:** Always set hard stop-loss distance using the $5 Prop Sizer before bidding.'
-    );
-  }
-
-  // 7. Today's Accomplishments / Progress Summary
-  if (q.includes('what did we do') || q.includes('today') || q.includes('progress') || q.includes('summary') || q.includes('accomplish')) {
-    return (
-      '🚀 *Everything We Built & Accomplished Today:*\n\n' +
-      '1. **Stripe Integration & Live Webhook (100%):**\n' +
-      '   • Created all 4 pricing tiers ($5, $19, $39, $79).\n' +
-      '   • Deployed `/api/stripe/webhook` with encrypted signature verification to auto-generate member passcodes and notify Telegram.\n\n' +
-      '2. **TradingView Indicator Evolution:**\n' +
-      '   • Built the complete Pine Script v5 engine.\n' +
-      '   • Eliminated lag, removed vertical scale bugs, and added dynamic `BUY/LONG` and `SELL/SHORT` signals paired with timely `TP` exits.\n\n' +
-      '3. **VIP Multi-Account Trade Copier Engine:**\n' +
-      '   • Deployed `/api/copier` with sub-5ms verified execution.\n' +
-      '   • Added automatic lot sizing that scales proportionally across mixed accounts ($100k, $25k, $10k).\n\n' +
-      '4. **Master Roadmap & Challenge Strategy:**\n' +
-      '   • Mapped the 2-week public streaming challenge ($70 prop account ➔ $2,000 payout).\n' +
-      '   • Set up the $765/year Autonomous Bot drop for 2027.\n\n' +
-      '5. **Production Deployment:** All changes compiled and live at https://candlesightai.com!'
-    );
-  }
-
-  // 8. Time / Clock queries
-  if (q.includes('time') || q.includes('clock')) {
-    return `⏱️ *Current System Time:* ${new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' })} (PST).`;
-  }
-
-  // 9. AI Neural Reasoning Engine: Handles literally any other question, strategy, or inquiry
-  try {
-    const prompt = `${SYSTEM_CONTEXT}\n\nIlya asked: "${rawText}"\nProvide a direct, thorough, and highly intelligent answer:`;
-    const result = await aiModel.generateContent(prompt);
-    const aiText = result.response.text();
-    if (aiText && aiText.trim().length > 0) {
-      return aiText.trim();
-    }
-  } catch (err) {
-    console.error('[Gemini AI Fallback Error]:', err.message);
-  }
-
-  // Backup fallback if AI network is momentarily busy
-  return (
-    `🤖 *Ilya, here is the quick status:*\n\n` +
-    `• **Website:** https://candlesightai.com (100% online)\n` +
-    `• **Copier & Webhooks:** Active\n` +
-    `• **TradingView Engine:** Ready in scripts/tradingview_candlesight_v5.pine\n\n` +
-    `I am actively listening and monitoring your systems 24/7.`
-  );
+function calculateMACDSeries(closes) {
+  const ema12 = calculateEMA(closes, 12);
+  const ema26 = calculateEMA(closes, 26);
+  const macdLine = ema12.map((val, idx) => val - ema26[idx]);
+  const signalLine = calculateEMA(macdLine, 9);
+  return { macdLine, signalLine };
 }
 
-async function handleMessage(msg) {
-  const chatId = String(msg.chat.id);
-  if (chatId !== ALLOWED_CHAT_ID) return;
-
-  const text = (msg.text || '').trim();
-  console.log(`[Telegram Daemon] Question from Ilya: "${text}"`);
-
-  try {
-    const reply = await answerQuestionIntelligently(text);
-    console.log(`[Telegram Daemon] Generated reply length: ${reply ? reply.length : 0}`);
-    
-    // Attempt HTML or Markdown, fallback to clean plain text
-    let res = await sendTelegram('sendMessage', {
-      chat_id: chatId,
-      text: reply,
-      parse_mode: 'Markdown',
-    });
-    
-    if (!res || res.ok === false) {
-      console.warn(`[Telegram Daemon] Markdown rejected (${res ? res.description : 'no res'}), delivering plain text...`);
-      res = await sendTelegram('sendMessage', {
-        chat_id: chatId,
-        text: reply.replace(/[*_`#\[\]()]/g, ''),
-      });
-      console.log(`[Telegram Daemon] Plaintext delivery status: ${res && res.ok ? 'SUCCESS' : 'FAILED'}`);
+function calculateATRSeries(highs, lows, closes, period = 14) {
+  const atr = new Array(closes.length).fill(0);
+  const trs = [highs[0] - lows[0]];
+  for (let i = 1; i < closes.length; i++) {
+    trs.push(
+      Math.max(
+        highs[i] - lows[i],
+        Math.abs(highs[i] - closes[i - 1]),
+        Math.abs(lows[i] - closes[i - 1])
+      )
+    );
+  }
+  let sum = 0;
+  for (let i = 0; i < closes.length; i++) {
+    if (i < period) {
+      sum += trs[i];
+      atr[i] = sum / (i + 1);
     } else {
-      console.log(`[Telegram Daemon] Markdown delivery status: SUCCESS`);
+      atr[i] = (atr[i - 1] * (period - 1) + trs[i]) / period;
     }
-  } catch (err) {
-    console.error('[Telegram Daemon] Error in handleMessage:', err);
-    await sendTelegram('sendMessage', {
-      chat_id: chatId,
-      text: `Error processing question: ${err.message}`,
-    });
   }
+  return atr;
 }
 
-async function handleCallback(cb) {
-  const chatId = String(cb.from.id);
-  if (chatId !== ALLOWED_CHAT_ID) return;
-
-  console.log(`[Telegram Daemon] Button click: ${cb.data}`);
-
-  await sendTelegram('answerCallbackQuery', {
-    callback_query_id: cb.id,
-    text: cb.data.includes('approve') ? '✅ Confirmed & Approved!' : '❌ Action Declined!',
-  });
-
-  await sendTelegram('sendMessage', {
-    chat_id: chatId,
-    text: cb.data.includes('approve')
-      ? '✅ *Approval Received:* Your confirmation has been executed.'
-      : '❌ *Rejection Received:* Action halted.',
-    parse_mode: 'Markdown',
-  });
+function formatPrice(p) {
+  if (p >= 1000) return '$' + p.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (p >= 1) return '$' + p.toFixed(2);
+  return '$' + p.toFixed(4);
 }
 
-async function poll() {
+function formatSize(riskPerUnit, target) {
+  if (!riskPerUnit || riskPerUnit <= 0) return 'Auto';
+  const raw = TARGET_RISK_USD / riskPerUnit;
+  if (target.id === 'GOLD') {
+    const capped = Math.max(5, Math.min(20, Math.round(raw)));
+    return `${capped} GC`;
+  }
+  const rounded = target.decimals === 0 ? Math.max(1, Math.round(raw)) : Math.max(0.05, Number(raw.toFixed(target.decimals)));
+  return `${rounded} ${target.unit}`;
+}
+
+async function fetchYahooCandles(ticker) {
+  const data = await fetchJson(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=5m&range=2d`);
+  if (!data?.chart?.result?.[0]?.indicators?.quote?.[0]) return [];
+  const q = data.chart.result[0].indicators.quote[0];
+  const t = data.chart.result[0].timestamp || [];
+  const candles = [];
+  for (let i = 0; i < t.length - 1; i++) {
+    if (q.close[i] && q.high[i] && q.low[i]) {
+      candles.push({
+        time: t[i],
+        open: q.open[i],
+        high: q.high[i],
+        low: q.low[i],
+        close: q.close[i],
+      });
+    }
+  }
+  return candles;
+}
+
+async function fetchCoinbaseCandles(pair) {
+  const data = await fetchJson(`https://api.exchange.coinbase.com/products/${pair}/candles?granularity=300`);
+  if (!Array.isArray(data) || data.length < 60) return [];
+  // Drop index 0 (unclosed live bar) -> confirmed closed bars only
+  return data.slice(1, 120).reverse().map((c) => ({
+    time: c[0],
+    low: c[1],
+    high: c[2],
+    open: c[3],
+    close: c[4],
+    vol: c[5],
+  }));
+}
+
+async function scanMarket(target) {
   try {
-    const res = await sendTelegram(`getUpdates?offset=${offset}&timeout=25`, {});
-    if (res && res.ok && Array.isArray(res.result)) {
-      for (const update of res.result) {
-        offset = update.update_id + 1;
-        if (update.message) {
-          await handleMessage(update.message);
-        } else if (update.callback_query) {
-          await handleCallback(update.callback_query);
-        }
+    let candles = [];
+    let feedLabel = target.ticker || target.pair;
+
+    if (target.source === 'yahoo') {
+      candles = await fetchYahooCandles(target.ticker);
+      if (candles.length < 55 && target.fallbackTicker) {
+        candles = await fetchYahooCandles(target.fallbackTicker);
+        feedLabel = target.fallbackTicker;
+      }
+      if (candles.length < 55 && target.fallbackPair) {
+        candles = await fetchCoinbaseCandles(target.fallbackPair);
+        feedLabel = target.fallbackPair;
+      }
+    } else {
+      candles = await fetchCoinbaseCandles(target.pair);
+    }
+
+    if (candles.length < 55) return null;
+
+    const closes = candles.map((c) => c.close);
+    const highs = candles.map((c) => c.high);
+    const lows = candles.map((c) => c.low);
+
+    const ema9 = calculateEMA(closes, 9);
+    const ema21 = calculateEMA(closes, 21);
+    const ema50 = calculateEMA(closes, 50);
+    const { macdLine, signalLine } = calculateMACDSeries(closes);
+    const atr = calculateATRSeries(highs, lows, closes, 14);
+
+    // Replay Pine v6 state machine across historical confirmed bars
+    let marketState = 0;
+    let lastSignal = null;
+    let firedOnLastBar = null;
+
+    for (let i = 50; i < candles.length; i++) {
+      // 1. EMA 50 Slope Filter (Blocks counter-trend bounces in strong trends)
+      const ema50Slope = ema50[i] - ema50[i - 3];
+      const bullSlope = ema50Slope >= -(atr[i] * 0.05); // Cannot be sloping hard downward
+      const bearSlope = ema50Slope <= (atr[i] * 0.05);  // Cannot be sloping hard upward
+
+      // 2. Ribbon Separation Filter (Chop Killer — eliminates flat criss-crosses)
+      const ribbonSpread = Math.abs(ema9[i] - ema21[i]);
+      const minSpread = (atr[i] || 1) * 0.18;
+      const hasMomentumSpread = ribbonSpread >= minSpread;
+
+      // 3. Decisive Candle Body Filter (Anti-Wick Shield)
+      const candleRange = highs[i] - lows[i];
+      const candleBody = Math.abs(closes[i] - candles[i].open);
+      const isSolidBody = candleRange === 0 || (candleBody / candleRange >= 0.35);
+      const isGreenClose = closes[i] > candles[i].open;
+      const isRedClose = closes[i] < candles[i].open;
+
+      // STRICT INSTITUTIONAL 3-WAY CONFLUENCE (No unconfirmed breakout bypasses)
+      const bullTrend = closes[i] > ema50[i] && ema9[i] > ema21[i] && macdLine[i] >= signalLine[i] && bullSlope && hasMomentumSpread;
+      const freshBuyTrigger = ((ema9[i - 1] <= ema21[i - 1] && ema9[i] > ema21[i]) || 
+                               (macdLine[i - 1] <= signalLine[i - 1] && macdLine[i] > signalLine[i]) ||
+                               (closes[i - 1] <= ema50[i - 1] && closes[i] > ema50[i])) && isGreenClose && isSolidBody;
+      const buyEntry = bullTrend && freshBuyTrigger;
+
+      const bearTrend = closes[i] < ema50[i] && ema9[i] < ema21[i] && macdLine[i] <= signalLine[i] && bearSlope && hasMomentumSpread;
+      const freshSellTrigger = ((ema9[i - 1] >= ema21[i - 1] && ema9[i] < ema21[i]) || 
+                                (macdLine[i - 1] >= signalLine[i - 1] && macdLine[i] < signalLine[i]) ||
+                                (closes[i - 1] >= ema50[i - 1] && closes[i] < ema50[i])) && isRedClose && isSolidBody;
+      const sellEntry = bearTrend && freshSellTrigger;
+
+      const exitLong = ema9[i - 1] >= ema21[i - 1] && ema9[i] < ema21[i];
+      const exitShort = ema9[i - 1] <= ema21[i - 1] && ema9[i] > ema21[i];
+
+      const fireBuy = (marketState === 0 || marketState === -1) && buyEntry;
+      const fireSellShort = (marketState === 0 || marketState === 1) && sellEntry;
+      const fireExitLong = marketState === 1 && exitLong && !sellEntry;
+      const fireExitShort = marketState === -1 && exitShort && !buyEntry;
+
+      if (fireBuy) {
+        marketState = 1;
+        const sl = Math.min(closes[i] - atr[i] * 1.5, ema50[i] - atr[i] * 0.5);
+        const risk = Math.abs(closes[i] - sl);
+        lastSignal = {
+          type: 'BUY',
+          time: candles[i].time,
+          entry: closes[i],
+          sl,
+          risk,
+          tp1: closes[i] + risk * 1.0,
+          tp2: closes[i] + risk * 2.2,
+        };
+        if (i === candles.length - 1) firedOnLastBar = lastSignal;
+      } else if (fireSellShort) {
+        marketState = -1;
+        const sl = Math.max(closes[i] + atr[i] * 1.5, ema50[i] + atr[i] * 0.5);
+        const risk = Math.abs(sl - closes[i]);
+        lastSignal = {
+          type: 'SHORT',
+          time: candles[i].time,
+          entry: closes[i],
+          sl,
+          risk,
+          tp1: closes[i] - risk * 1.0,
+          tp2: closes[i] - risk * 2.2,
+        };
+        if (i === candles.length - 1) firedOnLastBar = lastSignal;
+      } else if (fireExitLong || fireExitShort) {
+        marketState = 0;
       }
     }
+
+    const curClose = closes[closes.length - 1];
+    const bias = marketState === 1 ? '🟢 LONG' : marketState === -1 ? '🔴 SHORT' : '⚪️ WAIT';
+
+    // Store state in global registry for cross-asset macro correlation
+    marketRegistry[target.id] = {
+      price: curClose,
+      bias,
+      marketState,
+      ema9: ema9[ema9.length - 1],
+      atr: atr[atr.length - 1]
+    };
+
+    if (firedOnLastBar) {
+      // 1. BTC MACRO ALIGNMENT FILTER FOR ALTCOINS
+      // Never send BUY on SOL/ETH if Bitcoin is in SHORT mode
+      if ((target.id === 'SOL' || target.id === 'ETH') && firedOnLastBar.type === 'BUY') {
+        const btcState = marketRegistry['BTC']?.marketState;
+        if (btcState === -1) {
+          console.log(`[FILTER BLOCKED] Suppressed ${target.id} BUY alert because Bitcoin is in confirmed 🔴 SHORT mode.`);
+          return { id: target.id, feed: feedLabel, icon: target.icon, price: curClose, bias, lastSignal };
+        }
+      }
+
+      // 2. OVEREXTENSION FILTER (Anti-FOMO Shield: NEVER alert if price stretched far from EMA 9)
+      const distFromEma9 = Math.abs(curClose - ema9[ema9.length - 1]);
+      const curAtr = atr[atr.length - 1] || 1;
+      if (distFromEma9 > curAtr * 1.3) {
+        console.log(`[FILTER BLOCKED] Suppressed ${target.id} ${firedOnLastBar.type} — price overextended (${distFromEma9.toFixed(2)} vs ATR ${curAtr.toFixed(2)}).`);
+        return { id: target.id, feed: feedLabel, icon: target.icon, price: curClose, bias, lastSignal };
+      }
+
+      // 3. WEEKEND CAPITAL SHIELD (Protect prop accounts from low-volume weekend chop)
+      if (isWeekendShieldActive()) {
+        console.log(`[WEEKEND SHIELD] Alert suppressed for ${target.id} — market in weekend chop zone until Sunday 6 PM EST.`);
+        return { id: target.id, feed: feedLabel, icon: target.icon, price: curClose, bias: '🛡 SHIELD', lastSignal };
+      }
+
+      const alertKey = `${target.id}_${firedOnLastBar.type}_${firedOnLastBar.time}`;
+      if (lastAlerted[target.id] !== alertKey) {
+        lastAlerted[target.id] = alertKey;
+        const badge = firedOnLastBar.type === 'BUY' ? '🟢 LONG' : '🔴 SHORT';
+        const sugSize = formatSize(firedOnLastBar.risk, target);
+        const msg =
+          `${target.icon} <b>${target.name} — ${badge}</b>\n` +
+          `📍 <b>Entry:</b> ${formatPrice(firedOnLastBar.entry)}\n` +
+          `🛑 <b>SL:</b> ${formatPrice(firedOnLastBar.sl)} <i>(Size: ${sugSize} | ~$${TARGET_RISK_USD} risk)</i>\n` +
+          `🎯 <b>TP:</b> ${formatPrice(firedOnLastBar.tp1)}`;
+
+        console.log(`[ALERT] Fired ${badge} on ${target.name} (${feedLabel}) @ ${curClose}`);
+        await sendTelegramMessage(msg);
+      }
+    }
+
+    return {
+      id: target.id,
+      feed: feedLabel,
+      icon: target.icon,
+      price: curClose,
+      bias,
+      lastSignal,
+    };
   } catch (err) {
-    console.error('[Telegram Daemon] Polling error:', err.message);
-    await new Promise((r) => setTimeout(r, 3000));
+    console.error(`Error scanning ${target.name}:`, err.message);
+    return null;
   }
-  setImmediate(poll);
 }
 
-console.log('[Telegram Daemon] Autonomous 24/7 assistant daemon running for Ilya.');
-poll();
+async function runScanCycle() {
+  const ts = new Date().toLocaleTimeString();
+  const summaries = [];
+  for (const target of SYMBOLS) {
+    const res = await scanMarket(target);
+    if (res) summaries.push(res);
+  }
+
+  if (summaries.length === 0) {
+    console.log(`[SCAN ${ts}] WARNING: 0 markets returned data.`);
+    return;
+  }
+
+  console.log(
+    `[SCAN ${ts}] ` +
+      summaries.map((s) => `${s.id}(${s.feed})=${formatPrice(s.price)} (${s.bias})`).join(' | ')
+  );
+
+  if (!startupSent) {
+    startupSent = true;
+    const lines = summaries
+      .map((s) => `${s.icon} <b>${s.id}:</b> ${formatPrice(s.price)} — ${s.bias}`)
+      .join('\n');
+    const msg =
+      `⚡️ <b>CANDLESIGHT v3 LIVE (REAL GC=F & NQ=F FUTURES)</b>\n\n` +
+      `${lines}\n\n` +
+      `🔔 <i>Short pings include Position, Size (~$${TARGET_RISK_USD} risk), Entry, SL & TP1/TP2!</i>`;
+    const ok = await sendTelegramMessage(msg);
+    console.log(`[STARTUP TG PING] ${ok ? 'SENT' : 'FAILED'}`);
+  }
+}
+
+// 11. 2-WAY INTERACTIVE TELEGRAM LISTENER (DIRECT YES/NO ANSWERS ON THE GO)
+let lastUpdateId = 0;
+const { GoogleGenerativeAI } = require("@google/generative-ai");
+const genAI = new GoogleGenerativeAI("AQ.Ab8RN6I4lp20NKYun7LhqWTZ_U6fkdk1WUnhLW38RCsPnHXByg");
+const aiModel = genAI.getGenerativeModel({ model: "gemini-flash-latest" });
+
+async function pollTelegramUpdates() {
+  try {
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${lastUpdateId + 1}&timeout=5`;
+    const res = await fetchJson(url);
+    if (!res || !res.ok || !Array.isArray(res.result)) return;
+
+    for (const update of res.result) {
+      lastUpdateId = update.update_id;
+      const msg = update.message;
+      if (!msg || !msg.text) continue;
+      const chatId = String(msg.chat.id);
+      if (chatId !== ADMIN_CHAT_ID) continue;
+
+      const userText = msg.text.trim();
+      const lower = userText.toLowerCase();
+      console.log(`[USER TEXT ON TELEGRAM] "${userText}"`);
+
+      // 1. Direct Quick Asset Lookups
+      let matchedTarget = null;
+      if (lower.includes('gold') || lower.includes('gc') || lower.includes('xau')) matchedTarget = 'GOLD';
+      else if (lower.includes('btc') || lower.includes('bitcoin')) matchedTarget = 'BTC';
+      else if (lower.includes('eth') || lower.includes('ethereum')) matchedTarget = 'ETH';
+      else if (lower.includes('sol') || lower.includes('solana')) matchedTarget = 'SOL';
+      else if (lower.includes('nq') || lower.includes('nasdaq')) matchedTarget = 'NQ';
+
+      if (matchedTarget && marketRegistry[matchedTarget]) {
+        const info = marketRegistry[matchedTarget];
+        const isTradeable = info.bias === '🟢 LONG' || info.bias === '🔴 SHORT';
+        const verdict = isTradeable 
+          ? `✅ <b>YES: TAKE ${matchedTarget} ${info.bias.includes('LONG') ? 'LONG' : 'SHORT'}</b>` 
+          : `❌ <b>NO: STAY FLAT ON ${matchedTarget}</b>`;
+        let levelsStr = '';
+        if (info.lastSignal) {
+          levelsStr = `\n• Entry: ${formatPrice(info.lastSignal.entry)} | SL: ${formatPrice(info.lastSignal.sl)}\n• TP1: ${formatPrice(info.lastSignal.tp1)} | TP2: ${formatPrice(info.lastSignal.tp2)}`;
+        }
+        const reply = 
+          `${verdict}\n` +
+          `• Price: ${formatPrice(info.price)} | Status: ${info.bias}` +
+          levelsStr +
+          `\n• ${isTradeable ? 'Sizing: Max $50 risk.' : 'Wait for clean trend breakout.'}`;
+        await sendTelegramMessage(reply);
+        continue;
+      }
+
+      // Direct TP / SL question handler
+      if (lower.includes('tp') || lower.includes('sl') || lower.includes('target') || lower.includes('stop')) {
+        const active = Object.values(marketRegistry).find(s => (s.bias === '🟢 LONG' || s.bias === '🔴 SHORT') && s.lastSignal);
+        if (active) {
+          const sig = active.lastSignal;
+          const reply = 
+            `🎯 <b>${active.id} ${sig.type} TARGETS:</b>\n` +
+            `• Entry: ${formatPrice(sig.entry)}\n` +
+            `• Stop Loss (SL): ${formatPrice(sig.sl)}\n` +
+            `• TP1: ${formatPrice(sig.tp1)}\n` +
+            `• TP2: ${formatPrice(sig.tp2)}\n` +
+            `• Sizing: Micro-lot (~$50 max risk)`;
+          await sendTelegramMessage(reply);
+          continue;
+        }
+      }
+
+      if (lower === '/status' || lower === 'status') {
+        const lines = Object.entries(marketRegistry).map(([id, s]) => `• <b>${id}:</b> ${formatPrice(s.price)} (${s.bias})`).join('\n');
+        await sendTelegramMessage(`📊 <b>CandleSight 24/7 Live Status</b>\n\n${lines}\n\n<i>Ask any asset: "gold?", "btc?", "sol yes or no?"</i>`);
+        continue;
+      }
+
+      // 2. Ultra-Fast AI Intelligence (Trading-Only Context)
+      const currentMarketContext = Object.entries(marketRegistry).map(([id, s]) => `${id}: ${formatPrice(s.price)} (${s.bias})`).join(', ');
+      const prompt = `
+You are the personal crypto and futures prop-firm trading assistant for Ilya on Telegram.
+LIVE MARKET STATUS RIGHT NOW: ${currentMarketContext}.
+
+CRITICAL RULES:
+- Maximum 2 lines!
+- Questions are strictly about crypto/futures trading. TP = Take Profit, SL = Stop Loss.
+- Line 1 MUST start with either "✅ YES: [Action & Asset]" or "❌ NO: [Action / Stay Flat]".
+- Line 2 is 1 short sentence with the exact price or reason.
+- Plain text only. No HTML tags, no markdown asterisks.
+
+Question from Ilya:
+"${userText}"
+`;
+      const aiResult = await aiModel.generateContent(prompt);
+      let reply = aiResult.response.text().replace(/[<>]/g, '');
+      await sendTelegramMessage(reply);
+    }
+  } catch (err) {
+    console.error('[POLL ERR]', err.message);
+  }
+}
+
+console.log('🚀 CandleSight Autonomous Top-5 Scanner v3 Initialized (GC=F, BTC, ETH, SOL, NQ=F)');
+runScanCycle();
+setInterval(runScanCycle, 60000);
+setInterval(pollTelegramUpdates, 2500);
+
