@@ -506,3 +506,14 @@ runScanCycle();
 setInterval(runScanCycle, 60000);
 setInterval(pollTelegramUpdates, 2500);
 
+// HTTP Health Check Server for Render Free Web Service Tier
+const http = require('http');
+const PORT = process.env.PORT || 10000;
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('CandleSight Autonomous Top-5 Scanner Running 24/7\n');
+}).listen(PORT, () => {
+  console.log(`📡 Cloud Health-check HTTP server listening on port ${PORT}`);
+});
+
+
