@@ -1,0 +1,133 @@
+//@version=5
+indicator("CandleSight AI — Institutional Precision v4", overlay=true)
+
+// =============================================================================
+// CANDLESIGHT AI — INSTITUTIONAL PRECISION ENGINE
+// Built for High-Retention Prop Firm & Retail Trading Subscriptions
+// Features:
+// 1. Pure Yellow VWAP + Blue EMA 9 Foundation
+// 2. Early Top / Bottom Exhaustion Reversal Snipers (No More Late Badges!)
+// 3. Anti-Chase Overextension Shield (Blocks Entries After Multi-Bar Runs)
+// 4. Dynamic Auto-Target Profit Projections
+// =============================================================================
+
+// --- Inputs ---
+grp_core = "Core Indicator Settings"
+len_ema = input.int(9, "Fast EMA Period", group=grp_core)
+atr_len = input.int(14, "ATR Volatility Period", group=grp_core)
+atr_thresh = input.float(1.3, "Anti-Chase Filter (Max ATR from EMA)", minval=0.5, step=0.1, group=grp_core)
+
+grp_rev = "Institutional Reversal Snipers"
+show_snipers = input.bool(true, "Show Top/Bottom Liquidity Snipers", group=grp_rev)
+wick_mult = input.float(1.4, "Rejection Wick Sensitivity", minval=1.0, step=0.1, group=grp_rev)
+
+grp_alerts = "Alert Display Settings"
+show_tp = input.bool(true, "Show Dynamic Target Projections", group=grp_alerts)
+
+// --- Calculations ---
+ema9 = ta.ema(close, len_ema)
+vwapVal = ta.vwap(hlc3)
+atrVal = ta.atr(atr_len)
+
+// Custom Colors: Yellow VWAP & Electric Blue EMA 9
+plot(vwapVal, "Institutional VWAP", color=#eab308, linewidth=2)
+plot(ema9, "Fast EMA 9", color=#00bfff, linewidth=2)
+
+// Candle Metrics
+candleBody = math.abs(close - open)
+upperWick = high - math.max(open, close)
+lowerWick = math.min(open, close) - low
+isGreen = close > open
+isRed = close < open
+
+// Distance from EMA 9 (Overextension Guard)
+distFromEma = math.abs(close - ema9)
+isOverextended = distFromEma > (atr_thresh * atrVal)
+
+// =============================================================================
+// 1. TOP & BOTTOM LIQUIDITY REVERSAL SNIPERS (CATALYZED AT THE PEAK)
+// =============================================================================
+// Top Reversal: Sweep of 10-bar high + heavy upper rejection wick + red reversal candle
+prevHigh10 = ta.highest(high[1], 10)
+topSweep = high >= prevHigh10 and upperWick >= (candleBody * wick_mult)
+topReversal = show_snipers and ((topSweep and isRed) or (high[1] >= prevHigh10[1] and upperWick[1] >= (candleBody[1] * wick_mult) and close < low[1]))
+
+// Bottom Reversal: Sweep of 10-bar low + heavy lower rejection wick + green reversal candle
+prevLow10 = ta.lowest(low[1], 10)
+bottomSweep = low <= prevLow10 and lowerWick >= (candleBody * wick_mult)
+bottomReversal = show_snipers and ((bottomSweep and isGreen) or (low[1] <= prevLow10[1] and lowerWick[1] >= (candleBody[1] * wick_mult) and close > high[1]))
+
+// =============================================================================
+// 2. TREND CONTINUATION / BOUNCE SIGNALS (PROTECTED BY ANTI-CHASE SHIELD)
+// =============================================================================
+// Standard Trend Bounce (Only fires when NOT overextended)
+trendBuy = not isOverextended and (
+     (close > vwapVal and low <= ema9 and close > ema9 and isGreen) or
+     (ta.crossover(close, ema9) and close > vwapVal and isGreen)
+     )
+
+trendSell = not isOverextended and (
+     (close < vwapVal and high >= ema9 and close < ema9 and isRed) or
+     (ta.crossunder(close, ema9) and close < vwapVal and isRed)
+     )
+
+// State Tracking to prevent duplicate / spam signals
+var int position = 0
+fireBuy = false
+fireSell = false
+fireTopReversal = false
+fireBottomReversal = false
+
+// Fire Top Reversal when in a long or neutral state
+if topReversal and position >= 0
+    fireTopReversal := true
+    position := -1
+
+// Fire Bottom Reversal when in a short or neutral state
+if bottomReversal and position <= 0
+    fireBottomReversal := true
+    position := 1
+
+// Fire Standard Trend Signals
+if trendBuy and position <= 0 and not fireBottomReversal
+    fireBuy := true
+    position := 1
+
+if trendSell and position >= 0 and not fireTopReversal
+    fireSell := true
+    position := -1
+
+// =============================================================================
+// 3. VISUAL SIGNAL SHAPES & LABELS
+// =============================================================================
+// Early Reversal Snipers (Peak & Trough)
+plotshape(fireTopReversal, title="Top Sniper (Short)", style=shape.labeldown, location=location.abovebar, color=#e11d48, text="SHORT (TOP)", textcolor=color.white, size=size.normal)
+plotshape(fireBottomReversal, title="Bottom Sniper (Buy)", style=shape.labelup, location=location.belowbar, color=#059669, text="BUY (BOTTOM)", textcolor=color.white, size=size.normal)
+
+// Standard Trend Following Signals (Healthy Pullbacks)
+plotshape(fireBuy, title="Trend BUY", style=shape.labelup, location=location.belowbar, color=#10b981, text="BUY", textcolor=color.white, size=size.normal)
+plotshape(fireSell, title="Trend SELL", style=shape.labeldown, location=location.abovebar, color=#f43f5e, text="SELL", textcolor=color.white, size=size.normal)
+
+// =============================================================================
+// 4. DYNAMIC TARGET LINES (TAKE PROFIT PROJECTION)
+// =============================================================================
+var line tpLine = na
+var label tpLabel = na
+
+if (fireBuy or fireBottomReversal) and show_tp
+    line.delete(tpLine)
+    label.delete(tpLabel)
+    targetPrice = close + (atrVal * 2.5)
+    tpLine := line.new(bar_index, targetPrice, bar_index + 12, targetPrice, color=#10b981, width=1, style=line.style_dashed)
+    tpLabel := label.new(bar_index + 12, targetPrice, "TP TARGET: " + str.tostring(targetPrice, "#.##"), color=color.new(#10b981, 20), textcolor=color.white, style=label.style_label_left, size=size.small)
+
+if (fireSell or fireTopReversal) and show_tp
+    line.delete(tpLine)
+    label.delete(tpLabel)
+    targetPrice = close - (atrVal * 2.5)
+    tpLine := line.new(bar_index, targetPrice, bar_index + 12, targetPrice, color=#f43f5e, width=1, style=line.style_dashed)
+    tpLabel := label.new(bar_index + 12, targetPrice, "TP TARGET: " + str.tostring(targetPrice, "#.##"), color=color.new(#f43f5e, 20), textcolor=color.white, style=label.style_label_left, size=size.small)
+
+// Alert Conditions for TradingView Webhooks / Mobile Notifications
+alertcondition(fireTopReversal or fireSell, title="CandleSight SELL Alert", message="🔴 CandleSight SELL / SHORT Alert on {{ticker}} at {{close}}")
+alertcondition(fireBottomReversal or fireBuy, title="CandleSight BUY Alert", message="🟢 CandleSight BUY / LONG Alert on {{ticker}} at {{close}}")
