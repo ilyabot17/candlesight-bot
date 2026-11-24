@@ -43,9 +43,42 @@ function isWeekendShieldActive() {
   return false;
 }
 
+let dailyAlertCount = 0;
+let currentAlertDay = new Date().toDateString();
+
+function isOutsideTradingHours() {
+  const now = new Date();
+  const estString = now.toLocaleString("en-US", { timeZone: "America/New_York" });
+  const estDate = new Date(estString);
+  const hour = estDate.getHours();
+  const minute = estDate.getMinutes();
+
+  // 1. Mute overnight, pre-market (before 8:30 AM EST) and post-market (after 4:30 PM EST)
+  if (hour < 8 || (hour === 8 && minute < 30) || hour >= 17) {
+    return true;
+  }
+
+  // 2. Mute Midday Lunch Dead-Zone (11:30 AM - 1:00 PM EST / 8:30 AM - 10:00 AM PST)
+  // Stops retail accounts from getting chopped up in low midday volume
+  if ((hour === 11 && minute >= 30) || hour === 12) {
+    return true;
+  }
+
+  return false;
+}
+
+function isDailyQuotaReached() {
+  const today = new Date().toDateString();
+  if (today !== currentAlertDay) {
+    currentAlertDay = today;
+    dailyAlertCount = 0;
+  }
+  return dailyAlertCount >= 2;
+}
+
 function fetchJson(url, headers = {}) {
   return new Promise((resolve) => {
-    https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0', ...headers }, timeout: 10000 }, (res) => {
+    const req = https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0', ...headers }, timeout: 8000 }, (res) => {
       let body = '';
       res.on('data', (d) => (body += d));
       res.on('end', () => {
@@ -56,7 +89,12 @@ function fetchJson(url, headers = {}) {
           resolve(null);
         }
       });
-    }).on('error', (err) => {
+    });
+    req.on('timeout', () => {
+      req.destroy();
+      resolve(null);
+    });
+    req.on('error', (err) => {
       console.error(`[NET ERR] ${url}: ${err.message}`);
       resolve(null);
     });
@@ -80,7 +118,7 @@ function sendTelegramMessage(text) {
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(data),
         },
-        timeout: 10000,
+        timeout: 8000,
       },
       (res) => {
         let b = '';
@@ -95,6 +133,10 @@ function sendTelegramMessage(text) {
         });
       }
     );
+    req.on('timeout', () => {
+      req.destroy();
+      resolve(false);
+    });
     req.on('error', (err) => {
       console.error(`[TG ERR] ${err.message}`);
       resolve(false);
@@ -113,12 +155,27 @@ function calculateEMA(prices, period) {
   return ema;
 }
 
-function calculateMACDSeries(closes) {
-  const ema12 = calculateEMA(closes, 12);
-  const ema26 = calculateEMA(closes, 26);
-  const macdLine = ema12.map((val, idx) => val - ema26[idx]);
-  const signalLine = calculateEMA(macdLine, 9);
-  return { macdLine, signalLine };
+function calculateVWAPSeries(candles) {
+  const vwap = [];
+  let cumTPV = 0;
+  let cumVol = 0;
+  let lastDay = -1;
+
+  for (let i = 0; i < candles.length; i++) {
+    const c = candles[i];
+    const d = new Date(c.time * 1000).getUTCDate();
+    if (d !== lastDay) {
+      lastDay = d;
+      cumTPV = 0;
+      cumVol = 0;
+    }
+    const tp = (c.high + c.low + c.close) / 3;
+    const vol = c.vol > 0 ? c.vol : 1;
+    cumTPV += tp * vol;
+    cumVol += vol;
+    vwap.push(cumVol > 0 ? cumTPV / cumVol : tp);
+  }
+  return vwap;
 }
 
 function calculateATRSeries(highs, lows, closes, period = 14) {
@@ -215,92 +272,106 @@ async function scanMarket(target) {
       candles = await fetchCoinbaseCandles(target.pair);
     }
 
-    if (candles.length < 55) return null;
+    if (candles.length < 25) return null;
 
     const closes = candles.map((c) => c.close);
     const highs = candles.map((c) => c.high);
     const lows = candles.map((c) => c.low);
 
     const ema9 = calculateEMA(closes, 9);
-    const ema21 = calculateEMA(closes, 21);
-    const ema50 = calculateEMA(closes, 50);
-    const { macdLine, signalLine } = calculateMACDSeries(closes);
+    const vwap = calculateVWAPSeries(candles);
     const atr = calculateATRSeries(highs, lows, closes, 14);
 
-    // Replay Pine v6 state machine across historical confirmed bars
     let marketState = 0;
     let lastSignal = null;
     let firedOnLastBar = null;
 
-    for (let i = 50; i < candles.length; i++) {
-      // 1. EMA 50 Slope Filter (Blocks counter-trend bounces in strong trends)
-      const ema50Slope = ema50[i] - ema50[i - 3];
-      const bullSlope = ema50Slope >= -(atr[i] * 0.05); // Cannot be sloping hard downward
-      const bearSlope = ema50Slope <= (atr[i] * 0.05);  // Cannot be sloping hard upward
+    // Pure CandleSight Engine: Fast EMA 9 + Session VWAP + Liquidity Snipers (Zero EMA 50 / Zero MACD)
+    for (let i = 12; i < candles.length; i++) {
+      const curClose = closes[i];
+      const curOpen = candles[i].open;
+      const curHigh = highs[i];
+      const curLow = lows[i];
+      const curEma9 = ema9[i];
+      const curVwap = vwap[i];
+      const curAtr = atr[i] || 1;
 
-      // 2. Ribbon Separation Filter (Chop Killer — eliminates flat criss-crosses)
-      const ribbonSpread = Math.abs(ema9[i] - ema21[i]);
-      const minSpread = (atr[i] || 1) * 0.18;
-      const hasMomentumSpread = ribbonSpread >= minSpread;
+      const candleBody = Math.abs(curClose - curOpen);
+      const upperWick = curHigh - Math.max(curOpen, curClose);
+      const lowerWick = Math.min(curOpen, curClose) - curLow;
+      const isGreen = curClose > curOpen;
+      const isRed = curClose < curOpen;
 
-      // 3. Decisive Candle Body Filter (Anti-Wick Shield)
-      const candleRange = highs[i] - lows[i];
-      const candleBody = Math.abs(closes[i] - candles[i].open);
-      const isSolidBody = candleRange === 0 || (candleBody / candleRange >= 0.35);
-      const isGreenClose = closes[i] > candles[i].open;
-      const isRedClose = closes[i] < candles[i].open;
+      const distFromEma9 = Math.abs(curClose - curEma9);
+      const isOverextended = distFromEma9 > curAtr * 1.3;
 
-      // STRICT INSTITUTIONAL 3-WAY CONFLUENCE (No unconfirmed breakout bypasses)
-      const bullTrend = closes[i] > ema50[i] && ema9[i] > ema21[i] && macdLine[i] >= signalLine[i] && bullSlope && hasMomentumSpread;
-      const freshBuyTrigger = ((ema9[i - 1] <= ema21[i - 1] && ema9[i] > ema21[i]) || 
-                               (macdLine[i - 1] <= signalLine[i - 1] && macdLine[i] > signalLine[i]) ||
-                               (closes[i - 1] <= ema50[i - 1] && closes[i] > ema50[i])) && isGreenClose && isSolidBody;
-      const buyEntry = bullTrend && freshBuyTrigger;
+      // 1. Top & Bottom Liquidity Snipers (Early Reversals at Highs/Lows)
+      const prevHigh10 = Math.max(...highs.slice(Math.max(0, i - 10), i));
+      const topSweep = curHigh >= prevHigh10 && upperWick >= (candleBody * 1.4);
+      const topReversal = (topSweep && isRed) || 
+                          (highs[i-1] >= prevHigh10 && (highs[i-1] - Math.max(candles[i-1].open, closes[i-1])) >= Math.abs(closes[i-1] - candles[i-1].open) * 1.4 && curClose < lows[i-1]);
 
-      const bearTrend = closes[i] < ema50[i] && ema9[i] < ema21[i] && macdLine[i] <= signalLine[i] && bearSlope && hasMomentumSpread;
-      const freshSellTrigger = ((ema9[i - 1] >= ema21[i - 1] && ema9[i] < ema21[i]) || 
-                                (macdLine[i - 1] >= signalLine[i - 1] && macdLine[i] < signalLine[i]) ||
-                                (closes[i - 1] >= ema50[i - 1] && closes[i] < ema50[i])) && isRedClose && isSolidBody;
-      const sellEntry = bearTrend && freshSellTrigger;
+      const prevLow10 = Math.min(...lows.slice(Math.max(0, i - 10), i));
+      const bottomSweep = curLow <= prevLow10 && lowerWick >= (candleBody * 1.4);
+      const bottomReversal = (bottomSweep && isGreen) || 
+                             (lows[i-1] <= prevLow10 && (Math.min(candles[i-1].open, closes[i-1]) - lows[i-1]) >= Math.abs(closes[i-1] - candles[i-1].open) * 1.4 && curClose > highs[i-1]);
 
-      const exitLong = ema9[i - 1] >= ema21[i - 1] && ema9[i] < ema21[i];
-      const exitShort = ema9[i - 1] <= ema21[i - 1] && ema9[i] > ema21[i];
+      // 2. Pure Trend Following: Bounce off EMA 9 with VWAP Alignment
+      const trendBuy = !isOverextended && (
+        (curClose > curVwap && curLow <= curEma9 && curClose > curEma9 && isGreen) ||
+        (curClose > curEma9 && closes[i-1] <= ema9[i-1] && curClose > curVwap && isGreen)
+      );
 
-      const fireBuy = (marketState === 0 || marketState === -1) && buyEntry;
-      const fireSellShort = (marketState === 0 || marketState === 1) && sellEntry;
-      const fireExitLong = marketState === 1 && exitLong && !sellEntry;
-      const fireExitShort = marketState === -1 && exitShort && !buyEntry;
+      const trendSell = !isOverextended && (
+        (curClose < curVwap && curHigh >= curEma9 && curClose < curEma9 && isRed) ||
+        (curClose < curEma9 && closes[i-1] >= ema9[i-1] && curClose < curVwap && isRed)
+      );
 
-      if (fireBuy) {
+      let buySignal = false;
+      let sellSignal = false;
+
+      if (bottomReversal && marketState <= 0) {
+        buySignal = true;
         marketState = 1;
-        const sl = Math.min(closes[i] - atr[i] * 1.5, ema50[i] - atr[i] * 0.5);
-        const risk = Math.abs(closes[i] - sl);
+      } else if (trendBuy && marketState <= 0) {
+        buySignal = true;
+        marketState = 1;
+      }
+
+      if (topReversal && marketState >= 0) {
+        sellSignal = true;
+        marketState = -1;
+      } else if (trendSell && marketState >= 0) {
+        sellSignal = true;
+        marketState = -1;
+      }
+
+      if (buySignal) {
+        const sl = curClose - curAtr * 1.5;
+        const risk = Math.abs(curClose - sl);
         lastSignal = {
           type: 'BUY',
           time: candles[i].time,
-          entry: closes[i],
+          entry: curClose,
           sl,
           risk,
-          tp1: closes[i] + risk * 1.0,
-          tp2: closes[i] + risk * 2.2,
+          tp1: curClose + risk * 2.0,
+          tp2: curClose + risk * 3.0,
         };
         if (i === candles.length - 1) firedOnLastBar = lastSignal;
-      } else if (fireSellShort) {
-        marketState = -1;
-        const sl = Math.max(closes[i] + atr[i] * 1.5, ema50[i] + atr[i] * 0.5);
-        const risk = Math.abs(sl - closes[i]);
+      } else if (sellSignal) {
+        const sl = curClose + curAtr * 1.5;
+        const risk = Math.abs(curClose - sl);
         lastSignal = {
           type: 'SHORT',
           time: candles[i].time,
-          entry: closes[i],
+          entry: curClose,
           sl,
           risk,
-          tp1: closes[i] - risk * 1.0,
-          tp2: closes[i] - risk * 2.2,
+          tp1: curClose - risk * 2.0,
+          tp2: curClose - risk * 3.0,
         };
         if (i === candles.length - 1) firedOnLastBar = lastSignal;
-      } else if (fireExitLong || fireExitShort) {
-        marketState = 0;
       }
     }
 
@@ -308,12 +379,17 @@ async function scanMarket(target) {
     const bias = marketState === 1 ? '🟢 LONG' : marketState === -1 ? '🔴 SHORT' : '⚪️ WAIT';
 
     // Store state in global registry for cross-asset macro correlation
+    const lastBar = candles[candles.length - 1];
     marketRegistry[target.id] = {
       price: curClose,
       bias,
       marketState,
       ema9: ema9[ema9.length - 1],
-      atr: atr[atr.length - 1]
+      atr: atr[atr.length - 1],
+      lastSignal,
+      freshSignalOnLastBar: !!firedOnLastBar,
+      isGreen: curClose >= lastBar.open,
+      isRed: curClose < lastBar.open
     };
 
     if (firedOnLastBar) {
@@ -341,16 +417,31 @@ async function scanMarket(target) {
         return { id: target.id, feed: feedLabel, icon: target.icon, price: curClose, bias: '🛡 SHIELD', lastSignal };
       }
 
+      // 4. ACTIVE SESSION SHIELD (Every ping MUST be 100% actionable!)
+      if (isOutsideTradingHours()) {
+        console.log(`[SESSION SHIELD] Suppressed ${target.id} alert — outside active US execution hours or in lunch dead-zone.`);
+        return { id: target.id, feed: feedLabel, icon: target.icon, price: curClose, bias, lastSignal };
+      }
+
+      // 5. DAILY 2-TRADE DISCIPLINE QUOTA (Never Overtrade!)
+      if (isDailyQuotaReached()) {
+        console.log(`[QUOTA SHIELD] Suppressed ${target.id} alert — daily 2-trade limit reached.`);
+        return { id: target.id, feed: feedLabel, icon: target.icon, price: curClose, bias, lastSignal };
+      }
+
       const alertKey = `${target.id}_${firedOnLastBar.type}_${firedOnLastBar.time}`;
       if (lastAlerted[target.id] !== alertKey) {
         lastAlerted[target.id] = alertKey;
-        const badge = firedOnLastBar.type === 'BUY' ? '🟢 LONG' : '🔴 SHORT';
+        dailyAlertCount++;
+        const badge = firedOnLastBar.type === 'BUY' ? '🟢 BUY / LONG' : '🔴 SELL / SHORT';
         const sugSize = formatSize(firedOnLastBar.risk, target);
         const msg =
+          `🎯 <b>ACTION MANDATE (${dailyAlertCount}/2 TODAY): TAKE THIS TRADE</b>\n\n` +
           `${target.icon} <b>${target.name} — ${badge}</b>\n` +
           `📍 <b>Entry:</b> ${formatPrice(firedOnLastBar.entry)}\n` +
-          `🛑 <b>SL:</b> ${formatPrice(firedOnLastBar.sl)} <i>(Size: ${sugSize} | ~$${TARGET_RISK_USD} risk)</i>\n` +
-          `🎯 <b>TP:</b> ${formatPrice(firedOnLastBar.tp1)}`;
+          `🛑 <b>SL:</b> ${formatPrice(firedOnLastBar.sl)} <i>(Size: ${sugSize} | ~$${TARGET_RISK_USD} max risk)</i>\n` +
+          `🎯 <b>TP:</b> ${formatPrice(firedOnLastBar.tp1)}\n\n` +
+          `⚡️ <i>Vetted A+ Setup. High-volume institutional session. Execute now!</i>`;
 
         console.log(`[ALERT] Fired ${badge} on ${target.name} (${feedLabel}) @ ${curClose}`);
         await sendTelegramMessage(msg);
@@ -409,7 +500,10 @@ const { GoogleGenerativeAI } = require("@google/generative-ai");
 const genAI = new GoogleGenerativeAI("AQ.Ab8RN6I4lp20NKYun7LhqWTZ_U6fkdk1WUnhLW38RCsPnHXByg");
 const aiModel = genAI.getGenerativeModel({ model: "gemini-flash-latest" });
 
+let isPolling = false;
 async function pollTelegramUpdates() {
+  if (isPolling) return;
+  isPolling = true;
   try {
     const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${lastUpdateId + 1}&timeout=5`;
     const res = await fetchJson(url);
@@ -436,19 +530,50 @@ async function pollTelegramUpdates() {
 
       if (matchedTarget && marketRegistry[matchedTarget]) {
         const info = marketRegistry[matchedTarget];
-        const isTradeable = info.bias === '🟢 LONG' || info.bias === '🔴 SHORT';
-        const verdict = isTradeable 
-          ? `✅ <b>YES: TAKE ${matchedTarget} ${info.bias.includes('LONG') ? 'LONG' : 'SHORT'}</b>` 
-          : `❌ <b>NO: STAY FLAT ON ${matchedTarget}</b>`;
-        let levelsStr = '';
-        if (info.lastSignal) {
-          levelsStr = `\n• Entry: ${formatPrice(info.lastSignal.entry)} | SL: ${formatPrice(info.lastSignal.sl)}\n• TP1: ${formatPrice(info.lastSignal.tp1)} | TP2: ${formatPrice(info.lastSignal.tp2)}`;
+        const curAtr = info.atr || 1;
+        const distFromEma9 = Math.abs(info.price - (info.ema9 || info.price));
+        const isOverextended = distFromEma9 > curAtr * 1.3;
+        const inDeadZone = isOutsideTradingHours();
+
+        let verdict = '';
+        let advice = '';
+
+        if (inDeadZone) {
+          verdict = `❌ <b>NO: STAY FLAT ON ${matchedTarget}</b>`;
+          advice = `Midday Lunch Dead-Zone / Off-hours. Volume is dead. Do not trade.`;
+        } else if (isOverextended) {
+          verdict = `❌ <b>NO: DO NOT CHASE ${matchedTarget}</b>`;
+          advice = `Price is overextended (${distFromEma9.toFixed(1)} from EMA 9 vs ATR ${curAtr.toFixed(1)}). A relief bounce will stop you out. Wait for pullback!`;
+        } else if (info.bias === '🔴 SHORT' && info.isGreen) {
+          verdict = `❌ <b>NO: DO NOT SHORT ${matchedTarget}</b>`;
+          advice = `Price is actively bouncing up (green candle). Never short into upward momentum! Wait for a rejection at EMA 9.`;
+        } else if (info.bias === '🟢 LONG' && info.isRed) {
+          verdict = `❌ <b>NO: DO NOT BUY ${matchedTarget}</b>`;
+          advice = `Price is actively pulling back (red candle). Never buy into falling momentum! Wait for a support bounce at EMA 9.`;
+        } else if (!info.freshSignalOnLastBar) {
+          verdict = `⏸ <b>NO FRESH ENTRY ON ${matchedTarget}</b>`;
+          advice = `Trend is ${info.bias}, but the entry already triggered earlier. Do NOT enter late into a moving trade. Wait for the next ping!`;
+        } else if (info.bias === '🟢 LONG') {
+          verdict = `✅ <b>YES: TAKE ${matchedTarget} LONG</b>`;
+          advice = `Confirmed fresh bounce holding above EMA 9 & VWAP. Sizing: Max $35 risk.`;
+        } else if (info.bias === '🔴 SHORT') {
+          verdict = `✅ <b>YES: TAKE ${matchedTarget} SHORT</b>`;
+          advice = `Confirmed fresh rejection holding below EMA 9 & VWAP. Sizing: Max $35 risk.`;
+        } else {
+          verdict = `❌ <b>NO: STAY FLAT ON ${matchedTarget}</b>`;
+          advice = `Chopping in neutral consolidation. Wait for clean breakout.`;
         }
+
+        let levelsStr = '';
+        if (info.lastSignal && !isOverextended) {
+          levelsStr = `\n• Entry: ${formatPrice(info.lastSignal.entry)} | SL: ${formatPrice(info.lastSignal.sl)}\n• TP1: ${formatPrice(info.lastSignal.tp1)}`;
+        }
+
         const reply = 
           `${verdict}\n` +
           `• Price: ${formatPrice(info.price)} | Status: ${info.bias}` +
           levelsStr +
-          `\n• ${isTradeable ? 'Sizing: Max $50 risk.' : 'Wait for clean trend breakout.'}`;
+          `\n• <i>${advice}</i>`;
         await sendTelegramMessage(reply);
         continue;
       }
@@ -498,22 +623,14 @@ Question from Ilya:
     }
   } catch (err) {
     console.error('[POLL ERR]', err.message);
+  } finally {
+    isPolling = false;
+    setTimeout(pollTelegramUpdates, 2000);
   }
 }
 
 console.log('🚀 CandleSight Autonomous Top-5 Scanner v3 Initialized (GC=F, BTC, ETH, SOL, NQ=F)');
 runScanCycle();
 setInterval(runScanCycle, 60000);
-setInterval(pollTelegramUpdates, 2500);
-
-// HTTP Health Check Server for Render Free Web Service Tier
-const http = require('http');
-const PORT = process.env.PORT || 10000;
-http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('CandleSight Autonomous Top-5 Scanner Running 24/7\n');
-}).listen(PORT, () => {
-  console.log(`📡 Cloud Health-check HTTP server listening on port ${PORT}`);
-});
-
+pollTelegramUpdates();
 
