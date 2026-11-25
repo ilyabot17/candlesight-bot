@@ -1,5 +1,5 @@
 //@version=5
-strategy("CandleSight AI — Institutional Trap Sniper Strategy v4", 
+strategy("CandleSight AI — Institutional Master Strategy (v5/v6 Confluence)", 
          overlay=true, 
          initial_capital=10000, 
          currency=currency.USD,
@@ -11,25 +11,29 @@ strategy("CandleSight AI — Institutional Trap Sniper Strategy v4",
          max_bars_back=500)
 
 // =============================================================================
-// CANDLESIGHT AI — INSTITUTIONAL TRAP SNIPER v4 (WATERFALL SHIELD)
-// Keeps the winning +$2,392 mean-reversion engine from v2, but adds:
-// 1. WATERFALL SHIELD: Blocks BUY entries if the last 3 candles were all red cascade dumps.
-// 2. PARABOLIC SHIELD: Blocks SHORT entries if the last 3 candles were all green rocket pumps.
-// 3. REVERSAL CONFIRMATION: Bottom sweep must close above previous candle's midpoint.
+// CANDLESIGHT AI — MASTER STRATEGY (V5/V6 GOLDEN CONFLUENCE)
+// Restores the proven core from our highest-success v5/v6 paper testing:
+// 1. 15-Minute Macro Filter: request.security() checks 15m 50 EMA (kills counter-trend noise)
+// 2. 3-Ribbon Alignment: Fast EMA 9 > Trend EMA 21 > Macro Baseline EMA 50
+// 3. MACD Momentum Trigger: ta.crossover(macdLine, signalLine)
+// 4. Session Protection: US Hours Only (09:30-16:00 EST), skipping Lunch Dead-Zone
+// 5. Native Stop Loss (1.5 ATR) & Take Profit (1:2.0 R:R)
 // =============================================================================
 
 // --- Inputs ---
 grp_risk = "Risk & Target Management"
 fixed_qty = input.int(1, "Contracts / Lots per Trade", minval=1, group=grp_risk)
 rr_ratio = input.float(2.0, "Risk-to-Reward Ratio (TP Multiplier)", minval=1.0, step=0.5, group=grp_risk)
+atr_sl_mult = input.float(1.5, "Stop Loss ATR Multiplier", minval=1.0, step=0.1, group=grp_risk)
 
-grp_trap = "Institutional Liquidity Snipers"
-lookback_sweep = input.int(10, "Liquidity Sweep Lookback Bars", minval=5, maxval=30, group=grp_trap)
-wick_ratio = input.float(1.2, "Exhaustion Wick to Body Ratio", minval=1.0, step=0.1, group=grp_trap)
-min_vwap_dist_atr = input.float(1.0, "Min Distance from VWAP (in ATR)", minval=0.5, step=0.1, group=grp_trap)
+grp_ribbon = "Ribbon Settings (v5/v6 Foundation)"
+len_fast = input.int(9, "Fast EMA", group=grp_ribbon)
+len_slow = input.int(21, "Trend EMA", group=grp_ribbon)
+len_macro = input.int(50, "Macro Baseline EMA", group=grp_ribbon)
 
-grp_shield = "Waterfall Dump & Rocket Pump Shields"
-avoid_waterfalls = input.bool(true, "Avoid Catching 3-Bar Cascades", group=grp_shield)
+grp_htf = "Higher Timeframe Filter (The Noise Killer)"
+use_htf = input.bool(true, "Enable 15M Macro Filter", group=grp_htf)
+htf_timeframe = input.timeframe("15", "Macro Timeframe", group=grp_htf)
 
 grp_time = "Session Filter (US High Volume Hours)"
 use_session = input.bool(true, "Trade Only Active US Session", group=grp_time)
@@ -37,87 +41,81 @@ session_str = input.session("0930-1600:23456", "Active Hours (EST)", group=grp_t
 avoid_lunch = input.bool(true, "Avoid Midday Lunch Dead-Zone (11:30-13:00 EST)", group=grp_time)
 lunch_str = input.session("1130-1300:23456", "Lunch Dead-Zone", group=grp_time)
 
-// --- Indicator Calculations ---
-ema9 = ta.ema(close, 9)
+// --- Calculations ---
+ema9 = ta.ema(close, len_fast)
+ema21 = ta.ema(close, len_slow)
+ema50 = ta.ema(close, len_macro)
 vwapVal = ta.vwap(hlc3)
 atrVal = ta.atr(14)
 
-// Candle Metrics
-candleBody = math.abs(close - open)
-upperWick = high - math.max(open, close)
-lowerWick = math.min(open, close) - low
-isGreen = close > open
-isRed = close < open
+// 15-Minute Macro Filter
+htfEma50 = request.security(syminfo.tickerid, htf_timeframe, ta.ema(close, len_macro))
+htfClose = request.security(syminfo.tickerid, htf_timeframe, close)
+htfBull = not use_htf or (htfClose >= htfEma50)
+htfBear = not use_htf or (htfClose <= htfEma50)
+
+// MACD Momentum Engine (12, 26, 9)
+[macdLine, signalLine, histLine] = ta.macd(close, 12, 26, 9)
 
 // Session Window Check
 inSession = not use_session or not na(time(timeframe.period, session_str, "America/New_York"))
 inLunch = avoid_lunch and not na(time(timeframe.period, lunch_str, "America/New_York"))
 validTradingTime = inSession and not inLunch
 
-// Mean-Reversion Overextension from VWAP
-distFromVwap = math.abs(close - vwapVal)
-isExtended = distFromVwap >= (min_vwap_dist_atr * atrVal)
-
-// Waterfall / Rocket Shields
-// If the prior 3 bars were ALL red with zero green relief, that is a waterfall dump
-isWaterfallDump = avoid_waterfalls and (close[1] < open[1] and close[2] < open[2] and close[3] < open[3])
-// If the prior 3 bars were ALL green with zero red relief, that is a rocket pump
-isRocketPump = avoid_waterfalls and (close[1] > open[1] and close[2] > open[2] and close[3] > open[3])
-
-// Reversal Confirmation
-// To buy, current close must close above previous candle's midpoint (proof of buyers stepping in)
-prevMidpoint = (high[1] + low[1]) / 2.0
-confirmedBullish = close > prevMidpoint
-
-// To short, current close must close below previous candle's midpoint (proof of sellers stepping in)
-confirmedBearish = close < prevMidpoint
-
 // =============================================================================
-// INSTITUTIONAL TRAP DETECTION
+// V5/V6 STRICT 3-WAY INSTITUTIONAL CONFLUENCE SIGNALS
 // =============================================================================
 
-// 1. TOP LIQUIDITY TRAP (SHORT)
-prevHigh = ta.highest(high[1], lookback_sweep)
-topSweep = high >= prevHigh and upperWick >= (candleBody * wick_ratio)
-isTopTrap = isExtended and close > vwapVal and topSweep and isRed and confirmedBearish and not isRocketPump and validTradingTime
+// BULL CONFLUENCE:
+// 1. Price above 50 EMA & EMA 9 > EMA 21
+// 2. 15-Minute Macro is Bullish
+// 3. MACD crosses over bullishly OR EMA 9 crosses over EMA 21
+validBullTrend = (close > ema50) and (ema9 > ema21) and htfBull
+freshBuyTrigger = ta.crossover(macdLine, signalLine) or ta.crossover(ema9, ema21)
+buySignal = validBullTrend and freshBuyTrigger and validTradingTime
 
-// 2. BOTTOM LIQUIDITY TRAP (LONG)
-prevLow = ta.lowest(low[1], lookback_sweep)
-bottomSweep = low <= prevLow and lowerWick >= (candleBody * wick_ratio)
-isBottomTrap = isExtended and close < vwapVal and bottomSweep and isGreen and confirmedBullish and not isWaterfallDump and validTradingTime
+// BEAR CONFLUENCE:
+// 1. Price below 50 EMA & EMA 9 < EMA 21
+// 2. 15-Minute Macro is Bearish
+// 3. MACD crosses under bearishly OR EMA 9 crosses under EMA 21
+validBearTrend = (close < ema50) and (ema9 < ema21) and htfBear
+freshSellTrigger = ta.crossunder(macdLine, signalLine) or ta.crossunder(ema9, ema21)
+sellSignal = validBearTrend and freshSellTrigger and validTradingTime
 
 // =============================================================================
 // NATIVE STRATEGY EXECUTION
 // =============================================================================
 
 if (strategy.position_size == 0)
-    if isTopTrap
-        slPrice = high + (0.3 * atrVal)
-        riskDist = math.abs(slPrice - close)
-        tpPrice = close - (riskDist * rr_ratio)
-        
-        strategy.entry("Trap Short", strategy.short, qty=fixed_qty, comment="🛑 SNIPE SHORT")
-        strategy.exit("Exit Short", "Trap Short", stop=slPrice, limit=tpPrice, 
-                      comment_loss="❌ SL", comment_profit="🎯 TP")
-        
-    else if isBottomTrap
-        slPrice = low - (0.3 * atrVal)
+    if buySignal
+        slPrice = math.min(close - (atrVal * atr_sl_mult), ema50 - (atrVal * 0.5))
         riskDist = math.abs(close - slPrice)
         tpPrice = close + (riskDist * rr_ratio)
         
-        strategy.entry("Trap Long", strategy.long, qty=fixed_qty, comment="🟢 SNIPE BUY")
-        strategy.exit("Exit Long", "Trap Long", stop=slPrice, limit=tpPrice, 
+        strategy.entry("Master Long", strategy.long, qty=fixed_qty, comment="🟢 BUY / LONG")
+        strategy.exit("Exit Long", "Master Long", stop=slPrice, limit=tpPrice, 
+                      comment_loss="❌ SL", comment_profit="🎯 TP")
+        
+    else if sellSignal
+        slPrice = math.max(close + (atrVal * atr_sl_mult), ema50 + (atrVal * 0.5))
+        riskDist = math.abs(slPrice - close)
+        tpPrice = close - (riskDist * rr_ratio)
+        
+        strategy.entry("Master Short", strategy.short, qty=fixed_qty, comment="🔴 SELL / SHORT")
+        strategy.exit("Exit Short", "Master Short", stop=slPrice, limit=tpPrice, 
                       comment_loss="❌ SL", comment_profit="🎯 TP")
 
 // =============================================================================
 // CHART VISUALIZATIONS
 // =============================================================================
 
-plot(vwapVal, "Institutional VWAP", color=color.new(#eab308, 0), linewidth=2)
-plot(ema9, "Fast EMA 9", color=color.new(#00bfff, 0), linewidth=2)
+plot(ema9, "Fast EMA 9", color=color.new(#06b6d4, 0), linewidth=1)
+plot(ema21, "Trend EMA 21", color=color.new(#f59e0b, 0), linewidth=2)
+plot(ema50, "Macro Baseline 50", color=color.new(#8b5cf6, 0), linewidth=2)
+plot(vwapVal, "Session VWAP", color=color.new(#eab308, 0), linewidth=1)
 
-plotshape(isTopTrap, title="Short Signal", style=shape.labeldown, location=location.abovebar, 
-          color=color.red, text="SHORT", textcolor=color.white, size=size.normal)
+plotshape(buySignal, title="Buy Signal", style=shape.labelup, location=location.belowbar, 
+          color=#10b981, text="BUY", textcolor=color.white, size=size.normal)
 
-plotshape(isBottomTrap, title="Buy Signal", style=shape.labelup, location=location.belowbar, 
-          color=color.green, text="BUY", textcolor=color.white, size=size.normal)
+plotshape(sellSignal, title="Sell Signal", style=shape.labeldown, location=location.abovebar, 
+          color=#f43f5e, text="SHORT", textcolor=color.white, size=size.normal)
