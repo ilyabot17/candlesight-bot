@@ -220,7 +220,7 @@ function formatSize(riskPerUnit, target) {
 }
 
 async function fetchYahooCandles(ticker) {
-  const data = await fetchJson(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=5m&range=2d`);
+  const data = await fetchJson(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1h&range=14d`);
   if (!data?.chart?.result?.[0]?.indicators?.quote?.[0]) return [];
   const q = data.chart.result[0].indicators.quote[0];
   const t = data.chart.result[0].timestamp || [];
@@ -240,10 +240,11 @@ async function fetchYahooCandles(ticker) {
 }
 
 async function fetchCoinbaseCandles(pair) {
-  const data = await fetchJson(`https://api.exchange.coinbase.com/products/${pair}/candles?granularity=300`);
-  if (!Array.isArray(data) || data.length < 60) return [];
-  // Drop index 0 (unclosed live bar) -> confirmed closed bars only
-  return data.slice(1, 120).reverse().map((c) => ({
+  // 3600 = 1-Hour institutional candles (confirms true macro momentum)
+  const data = await fetchJson(`https://api.exchange.coinbase.com/products/${pair}/candles?granularity=3600`);
+  if (!Array.isArray(data) || data.length < 25) return [];
+  // Drop index 0 (unclosed live bar) -> confirmed closed 1H bars only
+  return data.slice(1, 200).reverse().map((c) => ({
     time: c[0],
     low: c[1],
     high: c[2],
@@ -278,113 +279,93 @@ async function scanMarket(target) {
     const highs = candles.map((c) => c.high);
     const lows = candles.map((c) => c.low);
 
-    const ema9 = calculateEMA(closes, 9);
-    const vwap = calculateVWAPSeries(candles);
+    // 1-Hour Institutional Trend-Rider Pro Engine
+    const emaPeriod = Math.min(closes.length > 100 ? 50 : 20, Math.floor(closes.length / 2));
+    const emaBaseline = calculateEMA(closes, emaPeriod);
     const atr = calculateATRSeries(highs, lows, closes, 14);
 
     let marketState = 0;
     let lastSignal = null;
     let firedOnLastBar = null;
+    let dynamicTrailStop = null;
 
-    // Pure CandleSight Engine: Fast EMA 9 + Session VWAP + Liquidity Snipers (Zero EMA 50 / Zero MACD)
-    for (let i = 12; i < candles.length; i++) {
+    // Scan through confirmed 1-Hour closes
+    const lookback = Math.min(20, Math.floor(candles.length / 2));
+    for (let i = lookback; i < candles.length; i++) {
       const curClose = closes[i];
-      const curOpen = candles[i].open;
       const curHigh = highs[i];
       const curLow = lows[i];
-      const curEma9 = ema9[i];
-      const curVwap = vwap[i];
       const curAtr = atr[i] || 1;
+      const curEma = emaBaseline[i] || curClose;
 
-      const candleBody = Math.abs(curClose - curOpen);
-      const upperWick = curHigh - Math.max(curOpen, curClose);
-      const lowerWick = Math.min(curOpen, curClose) - curLow;
-      const isGreen = curClose > curOpen;
-      const isRed = curClose < curOpen;
+      // Highest high and lowest low of previous 20 hours
+      const highest20H = Math.max(...highs.slice(i - lookback, i));
+      const lowest20H = Math.min(...lows.slice(i - lookback, i));
 
-      const distFromEma9 = Math.abs(curClose - curEma9);
-      const isOverextended = distFromEma9 > curAtr * 1.3;
+      const bullTrend = curClose > curEma;
+      const bearTrend = curClose < curEma;
 
-      // 1. Top & Bottom Liquidity Snipers (Early Reversals at Highs/Lows)
-      const prevHigh10 = Math.max(...highs.slice(Math.max(0, i - 10), i));
-      const topSweep = curHigh >= prevHigh10 && upperWick >= (candleBody * 1.4);
-      const topReversal = (topSweep && isRed) || 
-                          (highs[i-1] >= prevHigh10 && (highs[i-1] - Math.max(candles[i-1].open, closes[i-1])) >= Math.abs(closes[i-1] - candles[i-1].open) * 1.4 && curClose < lows[i-1]);
+      const longBreak = curClose > highest20H && closes[i - 1] <= highest20H && bullTrend;
+      const shortBreak = curClose < lowest20H && closes[i - 1] >= lowest20H && bearTrend;
 
-      const prevLow10 = Math.min(...lows.slice(Math.max(0, i - 10), i));
-      const bottomSweep = curLow <= prevLow10 && lowerWick >= (candleBody * 1.4);
-      const bottomReversal = (bottomSweep && isGreen) || 
-                             (lows[i-1] <= prevLow10 && (Math.min(candles[i-1].open, closes[i-1]) - lows[i-1]) >= Math.abs(closes[i-1] - candles[i-1].open) * 1.4 && curClose > highs[i-1]);
-
-      // 2. Pure Trend Following: Bounce off EMA 9 with VWAP Alignment
-      const trendBuy = !isOverextended && (
-        (curClose > curVwap && curLow <= curEma9 && curClose > curEma9 && isGreen) ||
-        (curClose > curEma9 && closes[i-1] <= ema9[i-1] && curClose > curVwap && isGreen)
-      );
-
-      const trendSell = !isOverextended && (
-        (curClose < curVwap && curHigh >= curEma9 && curClose < curEma9 && isRed) ||
-        (curClose < curEma9 && closes[i-1] >= ema9[i-1] && curClose < curVwap && isRed)
-      );
-
-      let buySignal = false;
-      let sellSignal = false;
-
-      if (bottomReversal && marketState <= 0) {
-        buySignal = true;
-        marketState = 1;
-      } else if (trendBuy && marketState <= 0) {
-        buySignal = true;
-        marketState = 1;
+      // Dynamic ATR Trailing Stop ratchet
+      if (marketState === 1 && dynamicTrailStop) {
+        dynamicTrailStop = Math.max(dynamicTrailStop, curHigh - curAtr * 3.0);
+        if (curClose < dynamicTrailStop) {
+          marketState = 0; // Exited long on trailing stop
+        }
+      } else if (marketState === -1 && dynamicTrailStop) {
+        dynamicTrailStop = Math.min(dynamicTrailStop, curLow + curAtr * 3.0);
+        if (curClose > dynamicTrailStop) {
+          marketState = 0; // Exited short on trailing stop
+        }
       }
 
-      if (topReversal && marketState >= 0) {
-        sellSignal = true;
-        marketState = -1;
-      } else if (trendSell && marketState >= 0) {
-        sellSignal = true;
-        marketState = -1;
-      }
-
-      if (buySignal) {
-        const sl = curClose - curAtr * 1.5;
-        const risk = Math.abs(curClose - sl);
+      if (longBreak && marketState <= 0) {
+        marketState = 1;
+        dynamicTrailStop = curClose - curAtr * 2.0;
+        const risk = curAtr * 2.0;
         lastSignal = {
           type: 'BUY',
           time: candles[i].time,
           entry: curClose,
-          sl,
+          sl: dynamicTrailStop,
+          trailStop: dynamicTrailStop,
           risk,
-          tp1: curClose + risk * 2.0,
+          tp1: curClose + risk * 1.5,
           tp2: curClose + risk * 3.0,
+          triggerLevel: highest20H,
         };
         if (i === candles.length - 1) firedOnLastBar = lastSignal;
-      } else if (sellSignal) {
-        const sl = curClose + curAtr * 1.5;
-        const risk = Math.abs(curClose - sl);
+      } else if (shortBreak && marketState >= 0) {
+        marketState = -1;
+        dynamicTrailStop = curClose + curAtr * 2.0;
+        const risk = curAtr * 2.0;
         lastSignal = {
           type: 'SHORT',
           time: candles[i].time,
           entry: curClose,
-          sl,
+          sl: dynamicTrailStop,
+          trailStop: dynamicTrailStop,
           risk,
-          tp1: curClose - risk * 2.0,
+          tp1: curClose - risk * 1.5,
           tp2: curClose - risk * 3.0,
+          triggerLevel: lowest20H,
         };
         if (i === candles.length - 1) firedOnLastBar = lastSignal;
       }
     }
 
     const curClose = closes[closes.length - 1];
-    const bias = marketState === 1 ? '🟢 LONG' : marketState === -1 ? '🔴 SHORT' : '⚪️ WAIT';
+    const bias = marketState === 1 ? '🟢 1H LONG' : marketState === -1 ? '🔴 1H SHORT' : '⚪️ NEUTRAL';
 
-    // Store state in global registry for cross-asset macro correlation
+    // Store state in global registry for Telegram bot queries
     const lastBar = candles[candles.length - 1];
     marketRegistry[target.id] = {
       price: curClose,
       bias,
       marketState,
-      ema9: ema9[ema9.length - 1],
+      emaBaseline: emaBaseline[emaBaseline.length - 1],
       atr: atr[atr.length - 1],
       lastSignal,
       freshSignalOnLastBar: !!firedOnLastBar,
@@ -393,57 +374,33 @@ async function scanMarket(target) {
     };
 
     if (firedOnLastBar) {
-      // 1. BTC MACRO ALIGNMENT FILTER FOR ALTCOINS
-      // Never send BUY on SOL/ETH if Bitcoin is in SHORT mode
-      if ((target.id === 'SOL' || target.id === 'ETH') && firedOnLastBar.type === 'BUY') {
-        const btcState = marketRegistry['BTC']?.marketState;
-        if (btcState === -1) {
-          console.log(`[FILTER BLOCKED] Suppressed ${target.id} BUY alert because Bitcoin is in confirmed 🔴 SHORT mode.`);
-          return { id: target.id, feed: feedLabel, icon: target.icon, price: curClose, bias, lastSignal };
-        }
-      }
-
-      // 2. OVEREXTENSION FILTER (Anti-FOMO Shield: NEVER alert if price stretched far from EMA 9)
-      const distFromEma9 = Math.abs(curClose - ema9[ema9.length - 1]);
-      const curAtr = atr[atr.length - 1] || 1;
-      if (distFromEma9 > curAtr * 1.3) {
-        console.log(`[FILTER BLOCKED] Suppressed ${target.id} ${firedOnLastBar.type} — price overextended (${distFromEma9.toFixed(2)} vs ATR ${curAtr.toFixed(2)}).`);
-        return { id: target.id, feed: feedLabel, icon: target.icon, price: curClose, bias, lastSignal };
-      }
-
-      // 3. WEEKEND CAPITAL SHIELD (Protect prop accounts from low-volume weekend chop)
-      if (isWeekendShieldActive()) {
-        console.log(`[WEEKEND SHIELD] Alert suppressed for ${target.id} — market in weekend chop zone until Sunday 6 PM EST.`);
-        return { id: target.id, feed: feedLabel, icon: target.icon, price: curClose, bias: '🛡 SHIELD', lastSignal };
-      }
-
-      // 4. ACTIVE SESSION SHIELD (Every ping MUST be 100% actionable!)
-      if (isOutsideTradingHours()) {
-        console.log(`[SESSION SHIELD] Suppressed ${target.id} alert — outside active US execution hours or in lunch dead-zone.`);
-        return { id: target.id, feed: feedLabel, icon: target.icon, price: curClose, bias, lastSignal };
-      }
-
-      // 5. DAILY 2-TRADE DISCIPLINE QUOTA (Never Overtrade!)
-      if (isDailyQuotaReached()) {
-        console.log(`[QUOTA SHIELD] Suppressed ${target.id} alert — daily 2-trade limit reached.`);
-        return { id: target.id, feed: feedLabel, icon: target.icon, price: curClose, bias, lastSignal };
-      }
-
       const alertKey = `${target.id}_${firedOnLastBar.type}_${firedOnLastBar.time}`;
       if (lastAlerted[target.id] !== alertKey) {
         lastAlerted[target.id] = alertKey;
         dailyAlertCount++;
-        const badge = firedOnLastBar.type === 'BUY' ? '🟢 BUY / LONG' : '🔴 SELL / SHORT';
+
+        const badge = firedOnLastBar.type === 'BUY' ? '🟢 1H BULLISH BREAKOUT' : '🔴 1H BEARISH BREAKDOWN';
+        const optionType = firedOnLastBar.type === 'BUY' ? 'CALL' : 'PUT';
+        const optionTicker = target.id === 'NQ' ? 'QQQ' : target.id === 'BTC' ? 'IBIT' : target.id;
         const sugSize = formatSize(firedOnLastBar.risk, target);
+
         const msg =
-          `🎯 <b>ACTION MANDATE (${dailyAlertCount}/2 TODAY): TAKE THIS TRADE</b>\n\n` +
+          `🚀 <b>CANDLESIGHT 1H INSTITUTIONAL ALERT</b>\n\n` +
           `${target.icon} <b>${target.name} — ${badge}</b>\n` +
           `📍 <b>Entry:</b> ${formatPrice(firedOnLastBar.entry)}\n` +
-          `🛑 <b>SL:</b> ${formatPrice(firedOnLastBar.sl)} <i>(Size: ${sugSize} | ~$${TARGET_RISK_USD} max risk)</i>\n` +
-          `🎯 <b>TP:</b> ${formatPrice(firedOnLastBar.tp1)}\n\n` +
-          `⚡️ <i>Vetted A+ Setup. High-volume institutional session. Execute now!</i>`;
+          `🛡 <b>Dynamic ATR Trail Stop:</b> ${formatPrice(firedOnLastBar.sl)}\n` +
+          `🎯 <b>Target 1 (+1.5R):</b> ${formatPrice(firedOnLastBar.tp1)}\n` +
+          `🎯 <b>Target 2 (+3.0R Runner):</b> ${formatPrice(firedOnLastBar.tp2)}\n\n` +
+          `🎯 <b>DEFINED-RISK OPTIONS PLAYBOOK:</b>\n` +
+          `• Buy 3–5 DTE ${optionTicker} ${optionType}\n` +
+          `• Capped Risk: $35–$50 USD (<b>0.00% Liquidation Risk</b>)\n` +
+          `• Outlier Profit Target: +150% to +300%\n\n` +
+          `🛡 <b>PROP EVAL SIZING (Vest / Apex):</b>\n` +
+          `• Size: ${sugSize} (~$50 max risk)\n` +
+          `• Leaves >90% of your evaluation buffer completely safe!\n\n` +
+          `<i>Trade institutional momentum. free TradingView script: candlesightai.com/script</i>`;
 
-        console.log(`[ALERT] Fired ${badge} on ${target.name} (${feedLabel}) @ ${curClose}`);
+        console.log(`[ALERT] Fired 1H ${badge} on ${target.name} (${feedLabel}) @ ${curClose}`);
         await sendTelegramMessage(msg);
       }
     }
@@ -496,9 +453,15 @@ async function runScanCycle() {
 
 // 11. 2-WAY INTERACTIVE TELEGRAM LISTENER (DIRECT YES/NO ANSWERS ON THE GO)
 let lastUpdateId = 0;
-const { GoogleGenerativeAI } = require("@google/generative-ai");
-const genAI = new GoogleGenerativeAI("AQ.Ab8RN6I4lp20NKYun7LhqWTZ_U6fkdk1WUnhLW38RCsPnHXByg");
-const aiModel = genAI.getGenerativeModel({ model: "gemini-flash-latest" });
+let aiModel = null;
+try {
+  const { GoogleGenerativeAI } = require("@google/generative-ai");
+  const geminiApiKey = process.env.GEMINI_API_KEY;
+  if (geminiApiKey) {
+    const genAI = new GoogleGenerativeAI(geminiApiKey);
+    aiModel = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+  }
+} catch (e) {}
 
 let isPolling = false;
 async function pollTelegramUpdates() {
@@ -603,7 +566,9 @@ async function pollTelegramUpdates() {
 
       // 2. Ultra-Fast AI Intelligence (Trading-Only Context)
       const currentMarketContext = Object.entries(marketRegistry).map(([id, s]) => `${id}: ${formatPrice(s.price)} (${s.bias})`).join(', ');
-      const prompt = `
+      if (aiModel) {
+        try {
+          const prompt = `
 You are the personal crypto and futures prop-firm trading assistant for Ilya on Telegram.
 LIVE MARKET STATUS RIGHT NOW: ${currentMarketContext}.
 
@@ -617,9 +582,16 @@ CRITICAL RULES:
 Question from Ilya:
 "${userText}"
 `;
-      const aiResult = await aiModel.generateContent(prompt);
-      let reply = aiResult.response.text().replace(/[<>]/g, '');
-      await sendTelegramMessage(reply);
+          const aiResult = await aiModel.generateContent(prompt);
+          let reply = aiResult.response.text().replace(/[<>]/g, '');
+          await sendTelegramMessage(reply);
+        } catch (aiErr) {
+          console.error('[AI ERR]', aiErr.message);
+          await sendTelegramMessage(`📊 <b>CandleSight 1H Trend Status:</b>\n${currentMarketContext}\n\n<i>Ask any asset: "btc?", "nq?", or "status"</i>`);
+        }
+      } else {
+        await sendTelegramMessage(`📊 <b>CandleSight 1H Trend Status:</b>\n${currentMarketContext}\n\n<i>Ask any asset: "btc?", "nq?", or "status"</i>`);
+      }
     }
   } catch (err) {
     console.error('[POLL ERR]', err.message);
