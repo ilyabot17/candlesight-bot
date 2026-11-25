@@ -1,29 +1,28 @@
 //@version=5
-strategy("CandleSight AI — Institutional Trap Sniper Strategy v1", 
+strategy("CandleSight AI — Institutional Trap Sniper Strategy v2", 
          overlay=true, 
          initial_capital=10000, 
          currency=currency.USD,
-         default_qty_type=strategy.cash, 
-         default_qty_value=1000, 
-         commission_type=strategy.commission.cash_per_order, 
+         default_qty_type=strategy.fixed, 
+         default_qty_value=1, 
+         commission_type=strategy.commission.cash_per_contract, 
          commission_value=2.0,
          slippage=1,
          max_bars_back=500)
 
 // =============================================================================
-// CANDLESIGHT AI — INSTITUTIONAL TRAP SNIPER (PRO-FIRM TESTER ENGINE)
-// Replaces lagging breakout crossovers with Institutional Exhaustion Sniping:
+// CANDLESIGHT AI — INSTITUTIONAL TRAP SNIPER (PRO-FIRM TESTER ENGINE v2)
+// Cleaned up with native strategy.exit() orders for true intra-bar fills:
 // 1. Fades retail FOMO at the extremes (Sweeps of 10-bar Highs/Lows + Rejection Wicks)
-// 2. Requires Mean-Reversion Overextension (>1.3 ATR away from Session VWAP)
-// 3. Prop-Firm Sizing: Hard-capped risk per trade ($30 risk per ticket)
-// 4. Institutional Targets: TP1 at Fast EMA 9, TP2 at Fair-Value Session VWAP
+// 2. Requires Mean-Reversion Overextension (>1.0 ATR away from Session VWAP)
+// 3. Automated Native Stop Loss & Take Profit Exits
+// 4. Session Protection: Trade during US session, avoiding Lunch Dead-Zone
 // =============================================================================
 
 // --- Inputs ---
-grp_risk = "Prop Firm Risk Management"
-target_risk_usd = input.float(30.0, "Target Risk Per Trade ($)", group=grp_risk, tooltip="Fixed dollar loss if Stop Loss is hit.")
-max_daily_loss = input.float(60.0, "Max Daily Loss Shield ($)", group=grp_risk, tooltip="Stops taking trades for the day if 2 losses hit.")
-rr_ratio = input.float(2.0, "Risk-to-Reward Ratio (TP2 Multiplier)", minval=1.5, step=0.5, group=grp_risk)
+grp_risk = "Risk & Target Management"
+fixed_qty = input.int(1, "Contracts / Lots per Trade", minval=1, group=grp_risk)
+rr_ratio = input.float(2.0, "Risk-to-Reward Ratio (TP Multiplier)", minval=1.0, step=0.5, group=grp_risk)
 
 grp_trap = "Institutional Liquidity Snipers"
 lookback_sweep = input.int(10, "Liquidity Sweep Lookback Bars", minval=5, maxval=30, group=grp_trap)
@@ -61,81 +60,38 @@ isExtended = distFromVwap >= (min_vwap_dist_atr * atrVal)
 // INSTITUTIONAL TRAP DETECTION (FADING RETAIL AT THE EXTREMES)
 // =============================================================================
 
-// 1. TOP LIQUIDITY TRAP (SHORT):
-// Price sweeps 10-bar high while extended above VWAP, prints massive upper wick, closes red
+// 1. TOP LIQUIDITY TRAP (SHORT)
 prevHigh = ta.highest(high[1], lookback_sweep)
 topSweep = high >= prevHigh and upperWick >= (candleBody * wick_ratio)
 isTopTrap = isExtended and close > vwapVal and topSweep and isRed and validTradingTime
 
-// 2. BOTTOM LIQUIDITY TRAP (LONG):
-// Price sweeps 10-bar low while extended below VWAP, prints massive lower wick, closes green
+// 2. BOTTOM LIQUIDITY TRAP (LONG)
 prevLow = ta.lowest(low[1], lookback_sweep)
 bottomSweep = low <= prevLow and lowerWick >= (candleBody * wick_ratio)
 isBottomTrap = isExtended and close < vwapVal and bottomSweep and isGreen and validTradingTime
 
 // =============================================================================
-// STRATEGY EXECUTION & PROP-FIRM RISK SIZING
+// NATIVE STRATEGY EXECUTION (CLEAN INTRA-BAR FILLS & ZERO LOGIC HANGS)
 // =============================================================================
 
-// State variables
-var float currentSL = na
-var float currentTP1 = na
-var float currentTP2 = na
-var float entryPrice = na
-
-// Calculate exact lot sizing based on fixed dollar risk
-calcQty(riskPerShare) =>
-    riskPerShare > 0 ? math.max(1, math.floor(target_risk_usd / riskPerShare)) : 1
-
-// --- Entry Logic ---
 if (strategy.position_size == 0)
     if isTopTrap
         slPrice = high + (0.3 * atrVal)
         riskDist = math.abs(slPrice - close)
-        qty = calcQty(riskDist)
+        tpPrice = close - (riskDist * rr_ratio)
         
-        entryPrice := close
-        currentSL := slPrice
-        currentTP1 := ema9
-        currentTP2 := close - (riskDist * rr_ratio)
-        
-        strategy.entry("Trap Short", strategy.short, qty=qty, comment="🛑 SHORT TRAP")
+        strategy.entry("Trap Short", strategy.short, qty=fixed_qty, comment="🛑 SHORT TRAP")
+        strategy.exit("Exit Short", "Trap Short", stop=slPrice, limit=tpPrice, 
+                      comment_loss="❌ SL", comment_profit="🎯 TP")
         
     else if isBottomTrap
         slPrice = low - (0.3 * atrVal)
         riskDist = math.abs(close - slPrice)
-        qty = calcQty(riskDist)
+        tpPrice = close + (riskDist * rr_ratio)
         
-        entryPrice := close
-        currentSL := slPrice
-        currentTP1 := ema9
-        currentTP2 := close + (riskDist * rr_ratio)
-        
-        strategy.entry("Trap Long", strategy.long, qty=qty, comment="🟢 BUY TRAP")
-
-// --- Exit Logic ---
-if (strategy.position_size < 0) // Managing Short
-    // Stop Loss Hit
-    if (high >= currentSL)
-        strategy.close("Trap Short", comment="❌ SL HIT")
-    // Take Profit Hit (Target VWAP / 1:2 R:R)
-    else if (low <= currentTP2)
-        strategy.close("Trap Short", comment="🎯 TP HIT")
-
-if (strategy.position_size > 0) // Managing Long
-    // Stop Loss Hit
-    if (low <= currentSL)
-        strategy.close("Trap Long", comment="❌ SL HIT")
-    // Take Profit Hit (Target VWAP / 1:2 R:R)
-    else if (high >= currentTP2)
-        strategy.close("Trap Long", comment="🎯 TP HIT")
-
-// Clean up state when flat
-if (strategy.position_size == 0)
-    currentSL := na
-    currentTP1 := na
-    currentTP2 := na
-    entryPrice := na
+        strategy.entry("Trap Long", strategy.long, qty=fixed_qty, comment="🟢 BUY TRAP")
+        strategy.exit("Exit Long", "Trap Long", stop=slPrice, limit=tpPrice, 
+                      comment_loss="❌ SL", comment_profit="🎯 TP")
 
 // =============================================================================
 // CHART VISUALIZATIONS
@@ -144,11 +100,6 @@ if (strategy.position_size == 0)
 plot(vwapVal, "Institutional VWAP", color=color.new(#eab308, 0), linewidth=2)
 plot(ema9, "Fast EMA 9", color=color.new(#00bfff, 0), linewidth=2)
 
-// Plot Active Trade Levels
-plot(strategy.position_size != 0 ? currentSL : na, "Stop Loss Level", color=color.red, style=plot.style_linebr, linewidth=2)
-plot(strategy.position_size != 0 ? currentTP2 : na, "Take Profit Level", color=color.green, style=plot.style_linebr, linewidth=2)
-
-// Plot Trap Signals
 plotshape(isTopTrap, title="Short Trap Signal", style=shape.labeldown, location=location.abovebar, 
           color=color.red, text="SNIPE SHORT", textcolor=color.white, size=size.normal)
 
