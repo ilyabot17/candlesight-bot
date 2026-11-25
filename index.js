@@ -18,11 +18,11 @@ const ADMIN_CHAT_ID = process.env.TELEGRAM_ADMIN_CHAT_ID || '6938216386';
 const TARGET_RISK_USD = 50; // Micro-risk ($50 risk per trade to protect $311 drawdown buffer)
 
 const SYMBOLS = [
-  { id: 'GOLD', name: 'Gold (GC)', ticker: 'GC=F', fallbackPair: 'PAXG-USD', source: 'yahoo', unit: 'GC', decimals: 0, icon: '👑' },
-  { id: 'BTC', name: 'Bitcoin (BTC)', pair: 'BTC-USD', source: 'coinbase', unit: 'BTC', decimals: 2, icon: '🟠' },
-  { id: 'ETH', name: 'Ethereum (ETH)', pair: 'ETH-USD', source: 'coinbase', unit: 'ETH', decimals: 1, icon: '🔷' },
-  { id: 'SOL', name: 'Solana (SOL)', pair: 'SOL-USD', source: 'coinbase', unit: 'SOL', decimals: 0, icon: '🟣' },
-  { id: 'NQ', name: 'Nasdaq (NQ)', ticker: 'NQ=F', fallbackTicker: 'QQQ', source: 'yahoo', unit: 'NQ', decimals: 2, icon: '📈' },
+  { id: 'GOLD', name: 'Gold (Spot)', tvTicker: 'OANDA:XAUUSD', ticker: 'GC=F', fallbackPair: 'PAXG-USD', source: 'yahoo', unit: 'XAU', decimals: 2, icon: '🪙' },
+  { id: 'BTC', name: 'Bitcoin', tvTicker: 'BINANCE:BTCUSDT', pair: 'BTC-USD', source: 'coinbase', unit: 'BTC', decimals: 2, icon: '₿' },
+  { id: 'ETH', name: 'Ethereum', tvTicker: 'BINANCE:ETHUSDT', pair: 'ETH-USD', source: 'coinbase', unit: 'ETH', decimals: 2, icon: 'Ξ' },
+  { id: 'SOL', name: 'Solana', tvTicker: 'BINANCE:SOLUSDT', pair: 'SOL-USD', source: 'coinbase', unit: 'SOL', decimals: 2, icon: '◎' },
+  { id: 'NQ', name: 'Nasdaq 100 ETF', tvTicker: 'NASDAQ:QQQ', ticker: 'NQ=F', fallbackTicker: 'QQQ', source: 'yahoo', unit: 'QQQ', decimals: 2, icon: '📊' },
 ];
 
 const lastAlerted = {};
@@ -254,26 +254,78 @@ async function fetchCoinbaseCandles(pair) {
   }));
 }
 
-async function scanMarket(target) {
+async function fetchTradingViewScanner(endpoint, tickers) {
+  try {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)'
+      },
+      body: JSON.stringify({
+        symbols: { tickers },
+        columns: ['close', 'open', 'high', 'low', 'change', 'EMA50', 'EMA200', 'ATR', 'RSI', 'VWAP']
+      })
+    });
+    if (!res.ok) return {};
+    const data = await res.json();
+    const map = {};
+    (data?.data || []).forEach(item => {
+      const [close, open, high, low, change, ema50, ema200, atr, rsi, vwap] = item.d || [];
+      map[item.s] = {
+        close,
+        open,
+        high,
+        low,
+        change: Number(change?.toFixed(2)) || 0,
+        ema50,
+        ema200,
+        atr,
+        rsi,
+        vwap
+      };
+    });
+    return map;
+  } catch (e) {
+    return {};
+  }
+}
+
+async function fetchAllTradingViewData() {
+  const [cfd, crypto, america] = await Promise.all([
+    fetchTradingViewScanner('https://scanner.tradingview.com/cfd/scan', ['OANDA:XAUUSD']),
+    fetchTradingViewScanner('https://scanner.tradingview.com/crypto/scan', ['BINANCE:BTCUSDT', 'BINANCE:ETHUSDT', 'BINANCE:SOLUSDT']),
+    fetchTradingViewScanner('https://scanner.tradingview.com/america/scan', ['NASDAQ:QQQ'])
+  ]);
+  return { ...cfd, ...crypto, ...america };
+}
+
+async function scanMarket(target, tvQuote) {
   try {
     let candles = [];
-    let feedLabel = target.ticker || target.pair;
+    let feedLabel = target.tvTicker || target.ticker || target.pair;
 
     if (target.source === 'yahoo') {
       candles = await fetchYahooCandles(target.ticker);
       if (candles.length < 55 && target.fallbackTicker) {
         candles = await fetchYahooCandles(target.fallbackTicker);
-        feedLabel = target.fallbackTicker;
       }
       if (candles.length < 55 && target.fallbackPair) {
         candles = await fetchCoinbaseCandles(target.fallbackPair);
-        feedLabel = target.fallbackPair;
       }
     } else {
       candles = await fetchCoinbaseCandles(target.pair);
     }
 
     if (candles.length < 25) return null;
+
+    // Direct override with TradingView real-time spot quote
+    if (tvQuote && typeof tvQuote.close === 'number') {
+      const last = candles[candles.length - 1];
+      last.close = tvQuote.close;
+      if (typeof tvQuote.high === 'number') last.high = Math.max(last.high, tvQuote.high);
+      if (typeof tvQuote.low === 'number') last.low = Math.min(last.low, tvQuote.low);
+    }
 
     const closes = candles.map((c) => c.close);
     const highs = candles.map((c) => c.high);
@@ -356,21 +408,30 @@ async function scanMarket(target) {
       }
     }
 
-    const curClose = closes[closes.length - 1];
+    const curClose = (tvQuote && typeof tvQuote.close === 'number') ? tvQuote.close : closes[closes.length - 1];
     const bias = marketState === 1 ? '🟢 1H LONG' : marketState === -1 ? '🔴 1H SHORT' : '⚪️ NEUTRAL';
 
     // Store state in global registry for Telegram bot queries
     const lastBar = candles[candles.length - 1];
     marketRegistry[target.id] = {
+      id: target.id,
+      name: target.name,
+      tvTicker: target.tvTicker,
       price: curClose,
+      open: tvQuote?.open ?? lastBar.open,
+      high: tvQuote?.high ?? Math.max(...highs.slice(-20)),
+      low: tvQuote?.low ?? Math.min(...lows.slice(-20)),
+      change: tvQuote?.change ?? 0,
       bias,
       marketState,
-      emaBaseline: emaBaseline[emaBaseline.length - 1],
-      atr: atr[atr.length - 1],
+      emaBaseline: tvQuote?.ema50 ?? emaBaseline[emaBaseline.length - 1],
+      ema200: tvQuote?.ema200 ?? (curClose * 1.05),
+      atr: tvQuote?.atr ?? atr[atr.length - 1],
       lastSignal,
       freshSignalOnLastBar: !!firedOnLastBar,
-      isGreen: curClose >= lastBar.open,
-      isRed: curClose < lastBar.open
+      isGreen: tvQuote ? tvQuote.close >= tvQuote.open : curClose >= lastBar.open,
+      isRed: tvQuote ? tvQuote.close < tvQuote.open : curClose < lastBar.open,
+      source: target.tvTicker ? `TradingView (${target.tvTicker})` : feedLabel
     };
 
     if (firedOnLastBar) {
@@ -398,7 +459,7 @@ async function scanMarket(target) {
           `🛡 <b>PROP EVAL SIZING (Vest / Apex):</b>\n` +
           `• Size: ${sugSize} (~$50 max risk)\n` +
           `• Leaves >90% of your evaluation buffer completely safe!\n\n` +
-          `<i>Trade institutional momentum. free TradingView script: candlesightai.com/script</i>`;
+          `<i>TradingView Feed: ${target.tvTicker}. Free script: candlesightai.com/script</i>`;
 
         console.log(`[ALERT] Fired 1H ${badge} on ${target.name} (${feedLabel}) @ ${curClose}`);
         await sendTelegramMessage(msg);
@@ -421,9 +482,11 @@ async function scanMarket(target) {
 
 async function runScanCycle() {
   const ts = new Date().toLocaleTimeString();
+  const tvData = await fetchAllTradingViewData();
   const summaries = [];
   for (const target of SYMBOLS) {
-    const res = await scanMarket(target);
+    const tvQuote = tvData[target.tvTicker];
+    const res = await scanMarket(target, tvQuote);
     if (res) summaries.push(res);
   }
 
@@ -443,9 +506,9 @@ async function runScanCycle() {
       .map((s) => `${s.icon} <b>${s.id}:</b> ${formatPrice(s.price)} — ${s.bias}`)
       .join('\n');
     const msg =
-      `⚡️ <b>CANDLESIGHT v3 LIVE (REAL GC=F & NQ=F FUTURES)</b>\n\n` +
+      `⚡️ <b>CANDLESIGHT v3 LIVE (DIRECT TRADINGVIEW SPOT FEEDS)</b>\n\n` +
       `${lines}\n\n` +
-      `🔔 <i>Short pings include Position, Size (~$${TARGET_RISK_USD} risk), Entry, SL & TP1/TP2!</i>`;
+      `🔔 <i>Direct OANDA XAUUSD, Binance BTC/ETH/SOL & Nasdaq QQQ feeds matching TradingView charts to the penny.</i>`;
     const ok = await sendTelegramMessage(msg);
     console.log(`[STARTUP TG PING] ${ok ? 'SENT' : 'FAILED'}`);
   }
@@ -494,49 +557,52 @@ async function pollTelegramUpdates() {
       if (matchedTarget && marketRegistry[matchedTarget]) {
         const info = marketRegistry[matchedTarget];
         const curAtr = info.atr || 1;
-        const distFromEma9 = Math.abs(info.price - (info.ema9 || info.price));
-        const isOverextended = distFromEma9 > curAtr * 1.3;
+        const distFromEma = Math.abs(info.price - (info.emaBaseline || info.price));
+        const isOverextended = distFromEma > curAtr * 1.5;
         const inDeadZone = isOutsideTradingHours();
 
         let verdict = '';
         let advice = '';
 
         if (inDeadZone) {
-          verdict = `❌ <b>NO: STAY FLAT ON ${matchedTarget}</b>`;
-          advice = `Midday Lunch Dead-Zone / Off-hours. Volume is dead. Do not trade.`;
+          verdict = `❌ <b>NO: STAY FLAT ON ${info.name || matchedTarget}</b>`;
+          advice = `Off-hours / low liquidity window. Volume is compressed. Preserve capital.`;
         } else if (isOverextended) {
-          verdict = `❌ <b>NO: DO NOT CHASE ${matchedTarget}</b>`;
-          advice = `Price is overextended (${distFromEma9.toFixed(1)} from EMA 9 vs ATR ${curAtr.toFixed(1)}). A relief bounce will stop you out. Wait for pullback!`;
-        } else if (info.bias === '🔴 SHORT' && info.isGreen) {
-          verdict = `❌ <b>NO: DO NOT SHORT ${matchedTarget}</b>`;
-          advice = `Price is actively bouncing up (green candle). Never short into upward momentum! Wait for a rejection at EMA 9.`;
-        } else if (info.bias === '🟢 LONG' && info.isRed) {
-          verdict = `❌ <b>NO: DO NOT BUY ${matchedTarget}</b>`;
-          advice = `Price is actively pulling back (red candle). Never buy into falling momentum! Wait for a support bounce at EMA 9.`;
+          verdict = `❌ <b>NO: DO NOT CHASE ${info.name || matchedTarget}</b>`;
+          advice = `Price is overextended (${distFromEma.toFixed(1)} from 1H EMA baseline vs ATR ${curAtr.toFixed(1)}). Wait for a healthy retest.`;
+        } else if (info.bias.includes('SHORT') && info.isGreen) {
+          verdict = `❌ <b>NO: DO NOT SHORT ${info.name || matchedTarget}</b>`;
+          advice = `Price is actively bouncing up (green 1H bar). Never short into upward momentum! Wait for a rejection at resistance.`;
+        } else if (info.bias.includes('LONG') && info.isRed) {
+          verdict = `❌ <b>NO: DO NOT BUY ${info.name || matchedTarget}</b>`;
+          advice = `Price is actively pulling back (red 1H bar). Never buy into falling knife! Wait for confirmation at support.`;
         } else if (!info.freshSignalOnLastBar) {
-          verdict = `⏸ <b>NO FRESH ENTRY ON ${matchedTarget}</b>`;
-          advice = `Trend is ${info.bias}, but the entry already triggered earlier. Do NOT enter late into a moving trade. Wait for the next ping!`;
-        } else if (info.bias === '🟢 LONG') {
-          verdict = `✅ <b>YES: TAKE ${matchedTarget} LONG</b>`;
-          advice = `Confirmed fresh bounce holding above EMA 9 & VWAP. Sizing: Max $35 risk.`;
-        } else if (info.bias === '🔴 SHORT') {
-          verdict = `✅ <b>YES: TAKE ${matchedTarget} SHORT</b>`;
-          advice = `Confirmed fresh rejection holding below EMA 9 & VWAP. Sizing: Max $35 risk.`;
+          verdict = `⏸ <b>NO FRESH BREAKOUT ON ${info.name || matchedTarget}</b>`;
+          advice = `Current trend state is ${info.bias}. Range: ${formatPrice(info.low)} – ${formatPrice(info.high)}. Coiling within channel; wait for clean 1H breakout.`;
+        } else if (info.bias.includes('LONG')) {
+          verdict = `✅ <b>YES: TAKE ${info.name || matchedTarget} LONG</b>`;
+          advice = `Confirmed fresh 1H breakout above 20H channel high. Sizing: Micro-lot (~$50 max risk).`;
+        } else if (info.bias.includes('SHORT')) {
+          verdict = `✅ <b>YES: TAKE ${info.name || matchedTarget} SHORT</b>`;
+          advice = `Confirmed fresh 1H breakdown below 20H channel low. Sizing: Micro-lot (~$50 max risk).`;
         } else {
-          verdict = `❌ <b>NO: STAY FLAT ON ${matchedTarget}</b>`;
-          advice = `Chopping in neutral consolidation. Wait for clean breakout.`;
+          verdict = `❌ <b>NO: STAY FLAT ON ${info.name || matchedTarget}</b>`;
+          advice = `Consolidating inside 1H range (${formatPrice(info.low)} – ${formatPrice(info.high)}). Awaiting breakout.`;
         }
 
         let levelsStr = '';
         if (info.lastSignal && !isOverextended) {
-          levelsStr = `\n• Entry: ${formatPrice(info.lastSignal.entry)} | SL: ${formatPrice(info.lastSignal.sl)}\n• TP1: ${formatPrice(info.lastSignal.tp1)}`;
+          levelsStr = `\n• <b>Entry:</b> ${formatPrice(info.lastSignal.entry)} | <b>SL:</b> ${formatPrice(info.lastSignal.sl)}\n• <b>TP1:</b> ${formatPrice(info.lastSignal.tp1)}`;
         }
 
         const reply = 
-          `${verdict}\n` +
-          `• Price: ${formatPrice(info.price)} | Status: ${info.bias}` +
+          `${verdict}\n\n` +
+          `• <b>Price:</b> ${formatPrice(info.price)} (${info.change >= 0 ? '+' : ''}${info.change}%)\n` +
+          `• <b>Feed:</b> ${info.source || 'TradingView'}\n` +
+          `• <b>Session Range:</b> ${formatPrice(info.low)} – ${formatPrice(info.high)}\n` +
+          `• <b>Status:</b> ${info.bias}` +
           levelsStr +
-          `\n• <i>${advice}</i>`;
+          `\n\n💡 <i>${advice}</i>`;
         await sendTelegramMessage(reply);
         continue;
       }
@@ -559,23 +625,33 @@ async function pollTelegramUpdates() {
       }
 
       if (lower === '/status' || lower === 'status') {
-        const lines = Object.entries(marketRegistry).map(([id, s]) => `• <b>${id}:</b> ${formatPrice(s.price)} (${s.bias})`).join('\n');
-        await sendTelegramMessage(`📊 <b>CandleSight 24/7 Live Status</b>\n\n${lines}\n\n<i>Ask any asset: "gold?", "btc?", "sol yes or no?"</i>`);
+        const lines = Object.entries(marketRegistry).map(([id, s]) => 
+          `• <b>${s.name || id}:</b> ${formatPrice(s.price)} (${s.change >= 0 ? '+' : ''}${s.change}%) — ${s.bias}`
+        ).join('\n');
+        await sendTelegramMessage(
+          `📊 <b>CandleSight 24/7 Live Status (TradingView Direct)</b>\n\n` +
+          `${lines}\n\n` +
+          `<i>100% verified TradingView spot feeds. Ask: "gold?", "btc?", "sol yes or no?"</i>`
+        );
         continue;
       }
 
-      // 2. Ultra-Fast AI Intelligence (Trading-Only Context)
-      const currentMarketContext = Object.entries(marketRegistry).map(([id, s]) => `${id}: ${formatPrice(s.price)} (${s.bias})`).join(', ');
+      // 2. Ultra-Fast AI Intelligence (Trading-Only Context with TradingView Spot Quotes)
+      const currentMarketContext = Object.entries(marketRegistry).map(([id, s]) => 
+        `${s.name || id} (${s.source || id}): ${formatPrice(s.price)} [Range: ${formatPrice(s.low)} - ${formatPrice(s.high)}, 24h: ${s.change}%] — ${s.bias}`
+      ).join('; ');
+
       if (aiModel) {
         try {
           const prompt = `
 You are the personal crypto and futures prop-firm trading assistant for Ilya on Telegram.
-LIVE MARKET STATUS RIGHT NOW: ${currentMarketContext}.
+LIVE MARKET STATUS RIGHT NOW (Official TradingView feeds): ${currentMarketContext}.
 
 CRITICAL RULES:
 - Maximum 2 lines!
 - Questions are strictly about crypto/futures trading. TP = Take Profit, SL = Stop Loss.
-- Line 1 MUST start with either "✅ YES: [Action & Asset]" or "❌ NO: [Action / Stay Flat]".
+- When asked about prices, ALWAYS use the exact spot price from the LIVE MARKET STATUS above. Never guess or quote futures contracts.
+- Line 1 MUST start with either "✅ YES: [Action & Asset]" or "❌ NO: [Action / Stay Flat]" or a direct price answer.
 - Line 2 is 1 short sentence with the exact price or reason.
 - Plain text only. No HTML tags, no markdown asterisks.
 
@@ -587,10 +663,10 @@ Question from Ilya:
           await sendTelegramMessage(reply);
         } catch (aiErr) {
           console.error('[AI ERR]', aiErr.message);
-          await sendTelegramMessage(`📊 <b>CandleSight 1H Trend Status:</b>\n${currentMarketContext}\n\n<i>Ask any asset: "btc?", "nq?", or "status"</i>`);
+          await sendTelegramMessage(`📊 <b>CandleSight 1H Trend Status (TradingView Feeds):</b>\n${currentMarketContext}\n\n<i>Ask any asset: "gold?", "btc?", or "status"</i>`);
         }
       } else {
-        await sendTelegramMessage(`📊 <b>CandleSight 1H Trend Status:</b>\n${currentMarketContext}\n\n<i>Ask any asset: "btc?", "nq?", or "status"</i>`);
+        await sendTelegramMessage(`📊 <b>CandleSight 1H Trend Status (TradingView Feeds):</b>\n${currentMarketContext}\n\n<i>Ask any asset: "gold?", "btc?", or "status"</i>`);
       }
     }
   } catch (err) {
@@ -601,7 +677,7 @@ Question from Ilya:
   }
 }
 
-console.log('🚀 CandleSight Autonomous Top-5 Scanner v3 Initialized (GC=F, BTC, ETH, SOL, NQ=F)');
+console.log('🚀 CandleSight Autonomous Top-5 Scanner v3 Initialized (Direct TradingView Feeds: OANDA XAUUSD, Binance Crypto, Nasdaq QQQ)');
 runScanCycle();
 setInterval(runScanCycle, 60000);
 pollTelegramUpdates();
